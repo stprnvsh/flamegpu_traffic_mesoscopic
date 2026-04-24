@@ -1,0 +1,6 @@
+*.pytest_cache/*
+*.pyc
+*.parquet
+*.rpm
+*.xml
+*.log

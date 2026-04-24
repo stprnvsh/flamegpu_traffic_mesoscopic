@@ -76,6 +76,8 @@ class SimulationConfig:
     rerouting_enabled: bool = False       # Enable dynamic rerouting
     rerouting_period: float = 60.0        # Rerouting check interval [s]
     rerouting_probability: float = 0.7    # Fraction of vehicles that can reroute
+    enable_calibrator_lite: bool = False
+    calibrator_gain: float = 0.05
 
 
 @dataclass
@@ -112,10 +114,18 @@ class NetworkData:
     node_id_map: Dict[str, int]           # ID -> index mapping
     
     # Optional fields with defaults
+    edge_priorities: List[int] = field(default_factory=list)
     edge_from_nodes: List[int] = field(default_factory=list)  # Upstream node indices
     edge_signal_ids: List[int] = field(default_factory=list)  # Signal ID (-1 if none)
     node_adjacency: Dict[int, List[int]] = field(default_factory=dict)  # For rerouting
     signals: List[Dict[str, Any]] = field(default_factory=list)  # Signal definitions
+    edge_successors: Dict[int, List[int]] = field(default_factory=dict)
+    movement_map: Dict[Tuple[int, int], List[Dict[str, Any]]] = field(default_factory=dict)
+    connections: List[Dict[str, Any]] = field(default_factory=list)
+    movement_successors: Dict[int, List[int]] = field(default_factory=dict)
+    movement_signal_map: Dict[Tuple[str, int], int] = field(default_factory=dict)  # (tl_id, linkIndex)->movement_id
+    movement_conflicts: Dict[int, List[int]] = field(default_factory=dict)  # movement_id -> conflicting movement_ids
+    movement_priority: Dict[int, int] = field(default_factory=dict)  # movement_id -> priority rank
     
     # Segment data (for SUMO meso compatibility)
     segments: List[SegmentData] = field(default_factory=list)  # Segment list
@@ -145,6 +155,7 @@ class NetworkData:
 class DemandData:
     """Processed demand data ready for simulation"""
     departures: List[Tuple[float, str, List[str], int]]  # (time, origin, route, count)
+    invalid_routes: List[Dict[str, Any]] = field(default_factory=list)
     
     @property
     def total_vehicles(self) -> int:
@@ -205,6 +216,8 @@ class MesoscopicSimulation:
         if model_config is None:
             model_config = ModelConfig()
         model_config.environment_config.time_step = self.config.time_step
+        model_config.environment_config.time_to_teleport = 180.0
+        model_config.environment_config.time_to_teleport_disconnected = 30.0
         
         # Set max route length if provided (will be set dynamically in initialize() otherwise)
         if max_route_length is not None:
@@ -370,6 +383,10 @@ class MesoscopicSimulation:
                 agent.setVariableInt("from_node", seg.from_node)
                 agent.setVariableInt("out_node", seg.to_node)
                 agent.setVariableInt("lane_count", seg.lanes)
+                prio = self.network.edge_priorities[seg.edge_idx] if seg.edge_idx < len(self.network.edge_priorities) else 0
+                agent.setVariableInt("priority_rank", prio)
+                agent.setVariableInt("conflict_group", seg.to_node if seg.to_node >= 0 else -1)
+                agent.setVariableFloat("junction_block_until", 0.0)
                 
                 # SUMO Mesoscopic 4-tau headway parameters
                 agent.setVariableFloat("tau_ff", tau_ff)
@@ -377,7 +394,7 @@ class MesoscopicSimulation:
                 agent.setVariableFloat("tau_jf", tau_jf)
                 agent.setVariableFloat("tau_jj", tau_jj)
                 
-                agent.setVariableFloat("jam_threshold", 0.5)
+                agent.setVariableFloat("jam_threshold", 0.8)
                 agent.setVariableFloat("block_time", 0.0)
                 agent.setVariableInt("is_jammed", 0)
                 
@@ -414,13 +431,17 @@ class MesoscopicSimulation:
                 agent.setVariableInt("from_node", from_node)
                 agent.setVariableInt("out_node", self.network.edge_to_nodes[i])
                 agent.setVariableInt("lane_count", self.network.edge_lanes[i])
+                prio = self.network.edge_priorities[i] if i < len(self.network.edge_priorities) else 0
+                agent.setVariableInt("priority_rank", prio)
+                agent.setVariableInt("conflict_group", self.network.edge_to_nodes[i] if i < len(self.network.edge_to_nodes) else -1)
+                agent.setVariableFloat("junction_block_until", 0.0)
                 
                 agent.setVariableFloat("tau_ff", tau_ff)
                 agent.setVariableFloat("tau_fj", tau_fj)
                 agent.setVariableFloat("tau_jf", tau_jf)
                 agent.setVariableFloat("tau_jj", tau_jj)
                 
-                agent.setVariableFloat("jam_threshold", 0.5)
+                agent.setVariableFloat("jam_threshold", 0.8)
                 agent.setVariableFloat("block_time", 0.0)
                 agent.setVariableInt("is_jammed", 0)
                 
@@ -472,7 +493,10 @@ class MesoscopicSimulation:
                 for j, edge_id in enumerate(phase.get("green_edges", [])):
                     if j < max_edges_per_phase:
                         edge_idx = self.network.edge_id_map.get(edge_id, -1)
-                        phase_green_edges[i * max_edges_per_phase + j] = edge_idx
+                        if edge_idx >= 0 and self.network.segments and edge_idx < len(self.network.edge_last_segment):
+                            phase_green_edges[i * max_edges_per_phase + j] = self.network.edge_last_segment[edge_idx]
+                        else:
+                            phase_green_edges[i * max_edges_per_phase + j] = edge_idx
             agent.setVariableArrayInt("phase_green_edges", phase_green_edges)
         
         # Add population to simulation
@@ -498,6 +522,8 @@ class MesoscopicSimulation:
         if self.config.verbose:
             print(f"Starting simulation for {sim_duration}s...")
             start_time = time.time()
+        else:
+            start_time = time.time()
         
         # Create interval data collector for per-edge per-interval data
         from .metrics import IntervalEdgeDataCollector
@@ -519,6 +545,8 @@ class MesoscopicSimulation:
             if step == next_collection:
                 current_time = step * self.config.time_step
                 self._interval_collector.collect(current_time)
+                if self.config.enable_calibrator_lite:
+                    self._apply_calibrator_lite()
                 self._interval_collector.last_collection_time = current_time  # Update for next interval
                 next_collection += steps_per_interval
                 # Set reset flag for THIS step
@@ -541,15 +569,21 @@ class MesoscopicSimulation:
         final_time = step * self.config.time_step
         if final_time > self._interval_collector.last_collection_time:
             self._interval_collector.collect(final_time)
+            if self.config.enable_calibrator_lite:
+                self._apply_calibrator_lite()
             self._interval_collector.last_collection_time = final_time
         
         if self.config.verbose:
             elapsed = time.time() - start_time
             print(f"Simulation completed in {elapsed:.2f}s "
                   f"({sim_duration/elapsed:.1f}x real-time)")
+        else:
+            elapsed = time.time() - start_time
         
         # Collect final results
         self._collect_results()
+        self._results["wall_time_seconds"] = elapsed
+        self._results["sim_seconds_per_wall_second"] = (sim_duration / elapsed) if elapsed > 0 else 0.0
         
         # Save all metrics to Parquet
         self._interval_collector.save(self.config.metrics_file)
@@ -579,6 +613,7 @@ class MesoscopicSimulation:
             "packets_waiting": waiting_pop.size(),
             "network_edges": self.network.num_edges,
             "total_demand": self.demand.total_vehicles,
+            "invalid_routes": len(self.demand.invalid_routes) if hasattr(self.demand, "invalid_routes") else 0,
         }
         
         # Collect per-edge statistics - EdgeQueue uses default state
@@ -596,6 +631,84 @@ class MesoscopicSimulation:
             })
         
         self._results["edge_stats"] = edge_stats
+        self._results["detector_view"] = self._build_detector_view()
+        self._results["teleport_reasons_visible"] = self._count_visible_teleport_reasons(traveling_pop, waiting_pop)
+        self._results["teleport_lifecycle_visible"] = self._count_visible_teleport_lifecycle(traveling_pop, waiting_pop)
+    
+    def _apply_calibrator_lite(self):
+        """Bounded host-side correction to edge travel_time."""
+        import pyflamegpu
+        edge_desc = self.model.model.getAgent("EdgeQueue")
+        edge_pop = pyflamegpu.AgentVector(edge_desc)
+        self.simulation.getPopulationData(edge_pop)
+        gain = max(0.0, min(0.5, self.config.calibrator_gain))
+        for i in range(edge_pop.size()):
+            agent = edge_pop[i]
+            curr = agent.getVariableInt("curr_count")
+            cap = max(1, agent.getVariableInt("capacity"))
+            occ = float(curr) / float(cap)
+            base = agent.getVariableFloat("length") / max(0.1, agent.getVariableFloat("free_speed"))
+            tt = agent.getVariableFloat("travel_time")
+            target = base * (1.0 + 0.8 * occ)
+            corrected = (1.0 - gain) * tt + gain * target
+            if corrected < base:
+                corrected = base
+            if corrected > base * 4.0:
+                corrected = base * 4.0
+            agent.setVariableFloat("travel_time", corrected)
+        self.simulation.setPopulationData(edge_pop)
+    
+    def _build_detector_view(self) -> List[Dict[str, Any]]:
+        """Project detector-style rows from interval edge metrics."""
+        if not hasattr(self, "_interval_collector") or self._interval_collector is None:
+            return []
+        edge_df = self._interval_collector.get_edge_dataframe()
+        if edge_df is None or edge_df.empty:
+            return []
+        latest = edge_df[edge_df["interval_end"] == edge_df["interval_end"].max()]
+        out = []
+        for _, row in latest.iterrows():
+            out.append({
+                "detector_id": f"det_{row['id']}",
+                "edge_id": row["id"],
+                "interval_end": float(row["interval_end"]),
+                "flow": float(row["flow"]),
+                "speed": float(row["speed"]),
+                "occupancy": float(row["occupancy"]),
+            })
+        return out
+    
+    def _count_visible_teleport_reasons(self, traveling_pop, waiting_pop) -> Dict[str, int]:
+        counts = {"jam": 0, "disconnected": 0, "route_end": 0}
+        for pop in (traveling_pop, waiting_pop):
+            for i in range(pop.size()):
+                reason = pop[i].getVariableInt("teleport_reason")
+                if reason == 1:
+                    counts["jam"] += 1
+                elif reason == 2:
+                    counts["disconnected"] += 1
+                elif reason == 3:
+                    counts["route_end"] += 1
+        return counts
+
+    def _count_visible_teleport_lifecycle(self, traveling_pop, waiting_pop) -> Dict[str, int]:
+        counts = {
+            "single_jump": 0,
+            "multi_step": 0,
+            "reroutes_while_teleporting": 0,
+            "failed_reentry_or_disconnected": 0,
+            "teleport_hops": 0,
+        }
+        for pop in (traveling_pop, waiting_pop):
+            for i in range(pop.size()):
+                agent = pop[i]
+                counts["single_jump"] += agent.getVariableInt("teleport_single_count")
+                counts["multi_step"] += agent.getVariableInt("teleport_multi_count")
+                counts["reroutes_while_teleporting"] += agent.getVariableInt("reroutes_while_teleporting")
+                counts["teleport_hops"] += agent.getVariableInt("teleport_hops")
+                if agent.getVariableInt("is_disconnected") == 1:
+                    counts["failed_reentry_or_disconnected"] += 1
+        return counts
     
     def get_results(self) -> Dict[str, Any]:
         """Get simulation results"""
@@ -758,6 +871,7 @@ def create_simple_network(
         edge_capacities=edge_capacities,
         edge_lanes=[e.get('lanes', 1) for e in edges],
         edge_to_nodes=[node_id_map.get(e.get('to_node', ''), -1) for e in edges],
+        edge_priorities=[e.get('priority', 0) for e in edges],
         edge_signal_ids=edge_signal_ids,
         node_ids=node_ids,
         node_id_map=node_id_map,
@@ -778,4 +892,19 @@ def create_simple_demand(
         DemandData instance
     """
     return DemandData(departures=departures)
+
+
+def evaluate_kpi_gate(baseline: Dict[str, Any], candidate: Dict[str, Any], max_regression_pct: float = 5.0) -> Dict[str, Any]:
+    """Simple rollout gate: fail if throughput regresses over threshold."""
+    base_tp = float(baseline.get("sim_seconds_per_wall_second", 0.0) or 0.0)
+    cand_tp = float(candidate.get("sim_seconds_per_wall_second", 0.0) or 0.0)
+    if base_tp <= 0.0:
+        return {"pass": True, "regression_pct": 0.0, "reason": "no-baseline-throughput"}
+    regression_pct = ((base_tp - cand_tp) / base_tp) * 100.0
+    return {
+        "pass": regression_pct <= max_regression_pct,
+        "regression_pct": regression_pct,
+        "base_throughput": base_tp,
+        "candidate_throughput": cand_tp,
+    }
 

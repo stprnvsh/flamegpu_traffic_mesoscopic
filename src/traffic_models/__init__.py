@@ -16,6 +16,7 @@ from .fundamental_diagram import (
     UnderwoodModel,
     DrakeModel,
     ThreeParameterModel,
+    runtime_fd_constants,
 )
 
 from .queue_models import (
@@ -42,6 +43,7 @@ __all__ = [
     'UnderwoodModel',
     'DrakeModel',
     'ThreeParameterModel',
+    'runtime_fd_constants',
     # Queue Models
     'QueueModel',
     'PointQueueModel',

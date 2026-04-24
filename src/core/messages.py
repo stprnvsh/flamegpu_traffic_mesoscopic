@@ -5,7 +5,7 @@ This module defines the message types used for inter-agent communication:
 1. entry_request - Packets requesting entry to edges (Bucket by edge_id)
 2. entry_accept - Edges accepting packets (BruteForce)
 3. departure_notice - Packets notifying departure from edges (Bucket by edge_id)
-4. green_signal - Signals broadcasting green state (BruteForce)
+4. green_signal - Signals broadcasting green state (Bucket by controlled id)
 
 Message Types in FLAMEGPU2:
 - MessageBruteForce: All agents see all messages (O(n×m))
@@ -53,6 +53,10 @@ def define_messages(model, config: Optional[MessageConfig] = None):
     msg_request.newVariableID("agent_id")                 # Requesting packet's ID
     msg_request.newVariableInt("from_edge")               # Origin segment (for headway calc)
     msg_request.newVariableInt("is_jammed")               # Origin segment jam state (for 4-tau)
+    msg_request.newVariableInt("from_node")               # Origin node for movement legality checks
+    msg_request.newVariableFloat("next_action_time")      # Due-time for event semantics
+    msg_request.newVariableInt("action_type")             # 0=none,1=request,2=move
+    msg_request.newVariableInt("event_seq")               # Monotonic event sequence per packet
     messages["entry_request"] = msg_request
     
     # =========================================================================
@@ -63,6 +67,9 @@ def define_messages(model, config: Optional[MessageConfig] = None):
     # Includes segment info so packets know where to go next
     msg_accept = model.newMessageBucket("entry_accept")
     msg_accept.setUpperBound(2000000)  # Max concurrent packets
+    msg_accept.newVariableInt("admit_status")              # 1=accept, 0=defer, -1=reject
+    msg_accept.newVariableFloat("retry_time")              # Earliest retry time for deferred requests
+    msg_accept.newVariableInt("reason_code")               # Optional reason code
     msg_accept.newVariableInt("edge_id")                  # Segment ID (index in segment list)
     msg_accept.newVariableFloat("travel_time")            # Travel time for this segment
     msg_accept.newVariableInt("out_node")                 # End node (for rerouting)
@@ -96,14 +103,34 @@ def define_messages(model, config: Optional[MessageConfig] = None):
     messages["edge_status"] = msg_status
     
     # =========================================================================
-    # 5. Green Signal Message (BruteForce)
+    # 5. Green Signal Message (Bucket by controlled segment/edge id)
     # =========================================================================
-    # Sent by SignalControllers to indicate green status for edges
-    # BruteForce because signals output multiple edges
-    msg_green = model.newMessageBruteForce("green_signal")
+    # Sent by SignalControllers to indicate green status for controlled ids
+    msg_green = model.newMessageBucket("green_signal")
+    msg_green.setUpperBound(config.max_edges - 1)
     msg_green.newVariableInt("edge_id")                   # Edge that has green
     msg_green.newVariableInt("node_id")                   # Junction node ID
     messages["green_signal"] = msg_green
+
+    # =========================================================================
+    # 6. Movement Request/Resolution (Conflict Arbitration)
+    # =========================================================================
+    msg_mreq = model.newMessageBucket("movement_request")
+    msg_mreq.setUpperBound(50000)  # conflict_group/node keyed
+    msg_mreq.newVariableID("agent_id")
+    msg_mreq.newVariableInt("target_segment")
+    msg_mreq.newVariableInt("priority_rank")
+    msg_mreq.newVariableFloat("request_time")
+    msg_mreq.newVariableInt("event_seq")
+    messages["movement_request"] = msg_mreq
+
+    msg_mres = model.newMessageBucket("movement_resolution")
+    msg_mres.setUpperBound(2000000)  # keyed by agent id
+    msg_mres.newVariableInt("permit")            # 1=permit,0=defer,-1=reject
+    msg_mres.newVariableFloat("defer_until")
+    msg_mres.newVariableInt("reason_code")
+    msg_mres.newVariableInt("target_segment")
+    messages["movement_resolution"] = msg_mres
     
     return messages
 

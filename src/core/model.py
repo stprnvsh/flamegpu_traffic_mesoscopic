@@ -52,6 +52,9 @@ class EnvironmentConfig:
     tau_fj: float = 1.4                       # Free-jam TAU factor
     tau_jf: float = 2.0                       # Jam-free TAU factor
     tau_jj: float = 1.4                       # Jam-jam TAU factor
+    time_to_teleport: float = 180.0           # General teleport threshold [s]
+    time_to_teleport_disconnected: float = 30.0  # Disconnected teleport threshold [s]
+    fd_runtime_mode: int = 1                  # 1=branch-light Newell-Daganzo
 
 
 @dataclass
@@ -164,6 +167,9 @@ class MesoscopicTrafficModel:
         env.newPropertyFloat("tau_fj", cfg.tau_fj)
         env.newPropertyFloat("tau_jf", cfg.tau_jf)
         env.newPropertyFloat("tau_jj", cfg.tau_jj)
+        env.newPropertyFloat("time_to_teleport", cfg.time_to_teleport)
+        env.newPropertyFloat("time_to_teleport_disconnected", cfg.time_to_teleport_disconnected)
+        env.newPropertyInt("fd_runtime_mode", cfg.fd_runtime_mode)
         
         # Interval metrics reset flag (set by host function to trigger reset)
         env.newPropertyInt("reset_interval_counters", 0)
@@ -431,10 +437,24 @@ def create_spawn_packets_function(departures: List[tuple], edge_id_map: Dict[str
                     packet.setVariableInt("route_idx", 0)
                     packet.setVariableInt("route_length", len(segment_route))
                     packet.setVariableFloat("remaining_time", length / speed if speed > 0 else 1.0)
+                    packet.setVariableFloat("next_event_time", current_time + (length / speed if speed > 0 else 1.0))
+                    packet.setVariableFloat("next_action_time", current_time)
+                    packet.setVariableInt("action_type", 2)
+                    packet.setVariableInt("event_seq", 0)
                     packet.setVariableFloat("entry_time", current_time)
                     packet.setVariableInt("destination", edge_route[-1] if edge_route else -1)
                     packet.setVariableFloat("wait_time", 0.0)
                     packet.setVariableInt("is_jammed", 0)
+                    packet.setVariableFloat("next_retry_time", 0.0)
+                    packet.setVariableInt("teleport_reason", 0)
+                    packet.setVariableInt("is_disconnected", 0)
+                    packet.setVariableInt("teleport_state", 0)
+                    packet.setVariableFloat("teleport_resume_time", 0.0)
+                    packet.setVariableInt("teleport_target_segment", -1)
+                    packet.setVariableInt("teleport_hops", 0)
+                    packet.setVariableInt("teleport_single_count", 0)
+                    packet.setVariableInt("teleport_multi_count", 0)
+                    packet.setVariableInt("reroutes_while_teleporting", 0)
                     
                     # Node info for rerouting
                     dest_idx = edge_route[-1] if edge_route else -1
@@ -475,10 +495,24 @@ def create_spawn_packets_function(departures: List[tuple], edge_id_map: Dict[str
                     packet.setVariableInt("route_idx", 0)
                     packet.setVariableInt("route_length", len(edge_route))
                     packet.setVariableFloat("remaining_time", length / speed if speed > 0 else 1.0)
+                    packet.setVariableFloat("next_event_time", current_time + (length / speed if speed > 0 else 1.0))
+                    packet.setVariableFloat("next_action_time", current_time)
+                    packet.setVariableInt("action_type", 2)
+                    packet.setVariableInt("event_seq", 0)
                     packet.setVariableFloat("entry_time", current_time)
                     packet.setVariableInt("destination", edge_route[-1] if edge_route else -1)
                     packet.setVariableFloat("wait_time", 0.0)
                     packet.setVariableInt("is_jammed", 0)
+                    packet.setVariableFloat("next_retry_time", 0.0)
+                    packet.setVariableInt("teleport_reason", 0)
+                    packet.setVariableInt("is_disconnected", 0)
+                    packet.setVariableInt("teleport_state", 0)
+                    packet.setVariableFloat("teleport_resume_time", 0.0)
+                    packet.setVariableInt("teleport_target_segment", -1)
+                    packet.setVariableInt("teleport_hops", 0)
+                    packet.setVariableInt("teleport_single_count", 0)
+                    packet.setVariableInt("teleport_multi_count", 0)
+                    packet.setVariableInt("reroutes_while_teleporting", 0)
                     
                     dest_idx = edge_route[-1] if edge_route else -1
                     dest_node = _edge_to_nodes[dest_idx] if (dest_idx >= 0 and dest_idx < len(_edge_to_nodes)) else -1

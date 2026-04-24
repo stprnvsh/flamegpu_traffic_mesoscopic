@@ -359,6 +359,8 @@ class SUMONetworkParser:
         self.nodes: Dict[str, SUMONode] = {}
         self.signals: Dict[str, SUMOSignal] = {}
         self.connections: Dict[str, List[str]] = {}  # from_edge -> [to_edges]
+        self.connection_records: List[Dict[str, Any]] = []
+        self.junction_requests: Dict[str, List[Dict[str, Any]]] = {}
     
     def parse(self, filepath: str) -> NetworkData:
         """
@@ -388,11 +390,11 @@ class SUMONetworkParser:
         # Parse edges
         self._parse_edges(root)
         
-        # Parse traffic lights
-        self._parse_traffic_lights(root)
-        
         # Parse connections
         self._parse_connections(root)
+        
+        # Parse traffic lights (needs connection linkIndex mapping)
+        self._parse_traffic_lights(root)
         
         # Convert to NetworkData
         return self._to_network_data()
@@ -412,6 +414,16 @@ class SUMONetworkParser:
                 y=float(junction.get('y', 0)),
                 type=junction.get('type', 'priority')
             )
+            # Parse right-of-way request matrix hints (if present).
+            reqs = []
+            for req in junction.findall('request'):
+                reqs.append({
+                    "index": int(req.get("index", "-1")),
+                    "response": req.get("response", ""),
+                    "foes": req.get("foes", ""),
+                    "cont": int(req.get("cont", "0")),
+                })
+            self.junction_requests[node_id] = reqs
     
     def _parse_edges(self, root: ET.Element):
         """Parse edge elements"""
@@ -486,9 +498,15 @@ class SUMONetworkParser:
         State string uses characters: G/g (green), r (red), y (yellow)
         Position corresponds to connection index
         """
-        # This is simplified - full implementation would need connection mapping
         green_edges = []
-        # Would need to cross-reference with connection data
+        for rec in self.connection_records:
+            if rec.get("tl") != tl_id:
+                continue
+            link_index = rec.get("linkIndex", -1)
+            if link_index < 0 or link_index >= len(state):
+                continue
+            if state[link_index] in ("g", "G"):
+                green_edges.append(rec["from"])
         return green_edges
     
     def _parse_connections(self, root: ET.Element):
@@ -506,6 +524,17 @@ class SUMONetworkParser:
             
             if to_edge not in self.connections[from_edge]:
                 self.connections[from_edge].append(to_edge)
+            self.connection_records.append({
+                "id": len(self.connection_records),
+                "from": from_edge,
+                "to": to_edge,
+                "fromLane": conn.get("fromLane", ""),
+                "toLane": conn.get("toLane", ""),
+                "dir": conn.get("dir", ""),
+                "tl": conn.get("tl", ""),
+                "linkIndex": int(conn.get("linkIndex", "-1")),
+                "via": conn.get("via", ""),
+            })
     
     def _to_network_data(self) -> NetworkData:
         """Convert parsed data to NetworkData format"""
@@ -560,6 +589,66 @@ class SUMONetworkParser:
                 if from_node_idx not in node_adjacency:
                     node_adjacency[from_node_idx] = []
                 node_adjacency[from_node_idx].append(edge_idx)
+        edge_successors = {}
+        movement_map = {}
+        movement_successors = {}
+        movement_signal_map = {}
+        movement_conflicts = {}
+        movement_priority = {}
+        connections = []
+        for from_edge, to_edges in self.connections.items():
+            from_idx = edge_id_map.get(from_edge, -1)
+            if from_idx < 0:
+                continue
+            edge_successors[from_idx] = [edge_id_map[e] for e in to_edges if e in edge_id_map]
+        for rec in self.connection_records:
+            from_idx = edge_id_map.get(rec["from"], -1)
+            to_idx = edge_id_map.get(rec["to"], -1)
+            if from_idx >= 0 and to_idx >= 0:
+                key = (from_idx, to_idx)
+                if key not in movement_map:
+                    movement_map[key] = []
+                movement_map[key].append({
+                    "id": rec.get("id", -1),
+                    "tl": rec.get("tl", ""),
+                    "linkIndex": rec.get("linkIndex", -1),
+                    "dir": rec.get("dir", ""),
+                    "fromLane": rec.get("fromLane", ""),
+                    "toLane": rec.get("toLane", ""),
+                    "via": rec.get("via", ""),
+                })
+                mov_id = rec.get("id", -1)
+                connections.append({
+                    "id": mov_id,
+                    "from_edge": from_idx,
+                    "to_edge": to_idx,
+                    "from_lane": int(rec.get("fromLane", "0") or 0),
+                    "to_lane": int(rec.get("toLane", "0") or 0),
+                    "dir": rec.get("dir", ""),
+                    "tl": rec.get("tl", ""),
+                    "linkIndex": rec.get("linkIndex", -1),
+                    "via": rec.get("via", ""),
+                })
+                if rec.get("tl", ""):
+                    movement_signal_map[(rec.get("tl", ""), rec.get("linkIndex", -1))] = mov_id
+                movement_priority[mov_id] = edge_list[from_idx].priority if from_idx < len(edge_list) else 0
+                movement_conflicts[mov_id] = []
+        # Build simple movement successor/conflict structures
+        for c in connections:
+            movement_successors[c["id"]] = []
+        from_groups: Dict[int, List[int]] = {}
+        for c in connections:
+            from_groups.setdefault(c["from_edge"], []).append(c["id"])
+        for c in connections:
+            next_from = c["to_edge"]
+            movement_successors[c["id"]] = from_groups.get(next_from, [])
+            # Basic conflict model: same to_edge conflicts (merge), same from_edge alternative turns conflict.
+            conflicts = set(from_groups.get(c["from_edge"], []))
+            for other in connections:
+                if other["id"] != c["id"] and other["to_edge"] == c["to_edge"]:
+                    conflicts.add(other["id"])
+            conflicts.discard(c["id"])
+            movement_conflicts[c["id"]] = sorted(conflicts)
         
         # Generate segments if enabled
         segments: List[SegmentData] = []
@@ -625,6 +714,7 @@ class SUMONetworkParser:
             edge_capacities=edge_capacities,
             edge_lanes=[e.lanes for e in edge_list],
             edge_to_nodes=edge_to_nodes_list,
+            edge_priorities=[e.priority for e in edge_list],
             node_ids=node_ids,
             node_id_map=node_id_map,
             # Optional fields
@@ -632,6 +722,13 @@ class SUMONetworkParser:
             edge_signal_ids=edge_signal_ids,
             node_adjacency=node_adjacency,
             signals=signals_list,
+            edge_successors=edge_successors,
+            movement_map=movement_map,
+            connections=connections,
+            movement_successors=movement_successors,
+            movement_signal_map=movement_signal_map,
+            movement_conflicts=movement_conflicts,
+            movement_priority=movement_priority,
             # Segment fields
             segments=segments,
             segment_id_map=segment_id_map,
@@ -660,6 +757,7 @@ class SUMORouteParser:
     
     def __init__(self,
                  edge_id_map: Optional[Dict[str, int]] = None,
+                 edge_successors: Optional[Dict[int, List[int]]] = None,
                  grouping_window: float = 5.0,
                  max_packet_size: int = 50):
         """
@@ -669,11 +767,45 @@ class SUMORouteParser:
             max_packet_size: Maximum vehicles per packet
         """
         self.edge_id_map = edge_id_map or {}
+        self.edge_successors = edge_successors or {}
         self.grouping_window = grouping_window
         self.max_packet_size = max_packet_size
         
         self.routes: Dict[str, List[str]] = {}  # route_id -> edge list
         self.vehicles: List[Dict[str, Any]] = []
+        self.invalid_routes: List[Dict[str, Any]] = []
+    
+    def _expand_route_if_needed(self, from_edge: str, to_edge: str) -> List[str]:
+        """Expand OD pair into edge path using BFS on edge_successors."""
+        if from_edge == to_edge:
+            return [from_edge]
+        if not self.edge_id_map or not self.edge_successors:
+            return [from_edge, to_edge]
+        start = self.edge_id_map.get(from_edge, -1)
+        goal = self.edge_id_map.get(to_edge, -1)
+        if start < 0 or goal < 0:
+            return [from_edge, to_edge]
+        from collections import deque
+        q = deque([start])
+        parent = {start: -1}
+        while q:
+            cur = q.popleft()
+            if cur == goal:
+                break
+            for nxt in self.edge_successors.get(cur, []):
+                if nxt not in parent:
+                    parent[nxt] = cur
+                    q.append(nxt)
+        if goal not in parent:
+            return [from_edge, to_edge]
+        idx_to_edge = {v: k for k, v in self.edge_id_map.items()}
+        route_idxs = []
+        cur = goal
+        while cur != -1:
+            route_idxs.append(cur)
+            cur = parent[cur]
+        route_idxs.reverse()
+        return [idx_to_edge[i] for i in route_idxs if i in idx_to_edge]
     
     def parse(self, filepath: str) -> DemandData:
         """
@@ -710,7 +842,7 @@ class SUMORouteParser:
         # Group into packets
         departures = self._group_vehicles()
         
-        return DemandData(departures=departures)
+        return DemandData(departures=departures, invalid_routes=self.invalid_routes)
     
     def _parse_routes(self, root: ET.Element):
         """Parse route definitions"""
@@ -767,10 +899,7 @@ class SUMORouteParser:
                 # via is space-separated list of intermediate edges
                 edges = [from_edge] + via.split() + [to_edge]
             else:
-                # Just origin and destination - for mesoscopic we need actual route
-                # If we have network with adjacency, we could compute route here
-                # For now, store as simple 2-edge "route" (will need routing)
-                edges = [from_edge, to_edge]
+                edges = self._expand_route_if_needed(from_edge, to_edge)
             
             self.vehicles.append({
                 'id': trip_id,
@@ -804,7 +933,7 @@ class SUMORouteParser:
             elif route_elem is not None:
                 edges = route_elem.get('edges', '').split()
             elif from_edge and to_edge:
-                edges = [from_edge, to_edge]  # Simplified
+                edges = self._expand_route_if_needed(from_edge, to_edge)
             else:
                 continue
             
@@ -828,6 +957,20 @@ class SUMORouteParser:
                     'route': edges,
                     'type': flow.get('type', 'default')
                 })
+    
+    def _is_route_connected(self, route: List[str]) -> bool:
+        if len(route) <= 1:
+            return True
+        if not self.edge_id_map or not self.edge_successors:
+            return True
+        for idx in range(len(route) - 1):
+            a = self.edge_id_map.get(route[idx], -1)
+            b = self.edge_id_map.get(route[idx + 1], -1)
+            if a < 0 or b < 0:
+                return False
+            if b not in self.edge_successors.get(a, []):
+                return False
+        return True
     
     def _generate_times_from_period(self, begin: float, end: float, 
                                      period: float) -> List[float]:
@@ -880,6 +1023,10 @@ class SUMORouteParser:
         
         while i < len(sorted_vehicles):
             v = sorted_vehicles[i]
+            if not self._is_route_connected(v["route"]):
+                self.invalid_routes.append({"vehicle_id": v["id"], "route": list(v["route"])})
+                i += 1
+                continue
             t = v['depart']
             route = tuple(v['route'])
             origin = v['route'][0] if v['route'] else ''
@@ -925,6 +1072,7 @@ def parse_sumo_network(filepath: str, **kwargs) -> NetworkData:
 
 def parse_sumo_routes(filepath: str, 
                       edge_id_map: Optional[Dict[str, int]] = None,
+                      edge_successors: Optional[Dict[int, List[int]]] = None,
                       **kwargs) -> DemandData:
     """
     Parse a SUMO routes or trips file
@@ -941,6 +1089,6 @@ def parse_sumo_routes(filepath: str,
         Trips (.trips.xml) contain origin-destination pairs without full routes.
         If routes need to be computed, pass the network's edge_id_map.
     """
-    parser = SUMORouteParser(edge_id_map=edge_id_map, **kwargs)
+    parser = SUMORouteParser(edge_id_map=edge_id_map, edge_successors=edge_successors, **kwargs)
     return parser.parse(filepath)
 

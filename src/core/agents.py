@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 MOVE_AND_REQUEST_CODE = """
 FLAMEGPU_AGENT_FUNCTION(move_and_request, flamegpu::MessageNone, flamegpu::MessageBucket) {
     const float dt = FLAMEGPU->environment.getProperty<float>("time_step");
-    const float teleport_threshold = 180.0f;  // Teleport if waiting > 180s (like SUMO)
+    const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
+    const float teleport_threshold = FLAMEGPU->environment.getProperty<float>("time_to_teleport");
+    const float teleport_disconnected_threshold = FLAMEGPU->environment.getProperty<float>("time_to_teleport_disconnected");
     
     // Check if already waiting for acceptance (don't decrement time again)
     const int ready = FLAMEGPU->getVariable<int>("ready_to_move");
@@ -39,10 +41,38 @@ FLAMEGPU_AGENT_FUNCTION(move_and_request, flamegpu::MessageNone, flamegpu::Messa
         wait_time += dt;
         FLAMEGPU->setVariable<float>("wait_time", wait_time);
         
-        // TELEPORT: If waiting too long, die
-        // Note: departure notice was sent before, so curr_count already decremented
-        if (wait_time > teleport_threshold) {
-            return flamegpu::DEAD;
+        // TELEPORT: reasoned branch behavior.
+        const int is_disconnected = FLAMEGPU->getVariable<int>("is_disconnected");
+        if ((is_disconnected == 1 && wait_time > teleport_disconnected_threshold) || (is_disconnected == 0 && wait_time > teleport_threshold)) {
+            const int route_idx = FLAMEGPU->getVariable<int>("route_idx");
+            const int route_length = FLAMEGPU->getVariable<int>("route_length");
+            if (route_idx + 1 >= route_length) {
+                FLAMEGPU->setVariable<int>("teleport_state", 3);  // removed
+                FLAMEGPU->setVariable<int>("teleport_reason", 3);  // route_end
+                return flamegpu::DEAD;
+            }
+            const int target_segment = FLAMEGPU->getVariable<int>("next_segment");
+            FLAMEGPU->setVariable<int>("teleport_target_segment", target_segment);
+            FLAMEGPU->setVariable<float>("wait_time", 0.0f);
+            if (is_disconnected == 1) {
+                const float resume_time = current_time + (5.0f * dt);
+                FLAMEGPU->setVariable<int>("teleport_state", 2);  // multi_step
+                FLAMEGPU->setVariable<int>("teleport_reason", 2);
+                FLAMEGPU->setVariable<int>("teleport_hops", FLAMEGPU->getVariable<int>("teleport_hops") + 1);
+                FLAMEGPU->setVariable<float>("teleport_resume_time", resume_time);
+                FLAMEGPU->setVariable<float>("next_retry_time", resume_time);
+                FLAMEGPU->setVariable<int>("route_idx", route_idx + 1);
+                FLAMEGPU->setVariable<int>("next_segment", target_segment);
+                FLAMEGPU->setVariable<int>("teleport_multi_count", FLAMEGPU->getVariable<int>("teleport_multi_count") + 1);
+                return flamegpu::ALIVE;
+            }
+            FLAMEGPU->setVariable<int>("teleport_state", 1);  // single_jump
+            FLAMEGPU->setVariable<int>("teleport_reason", 1);
+            FLAMEGPU->setVariable<int>("route_idx", route_idx + 1);
+            FLAMEGPU->setVariable<int>("next_segment", target_segment);
+            FLAMEGPU->setVariable<float>("next_retry_time", current_time);
+            FLAMEGPU->setVariable<int>("teleport_single_count", FLAMEGPU->getVariable<int>("teleport_single_count") + 1);
+            return flamegpu::ALIVE;
         }
         
         // Get next segment to request
@@ -53,6 +83,7 @@ FLAMEGPU_AGENT_FUNCTION(move_and_request, flamegpu::MessageNone, flamegpu::Messa
         // If no next segment AND at end of route, destination reached - die
         // Note: departure notice was already sent, so curr_count decremented
         if (next_segment < 0 && route_idx >= route_length - 1) {
+            FLAMEGPU->setVariable<int>("teleport_reason", 3);  // route_end
             return flamegpu::DEAD;
         }
         
@@ -61,16 +92,31 @@ FLAMEGPU_AGENT_FUNCTION(move_and_request, flamegpu::MessageNone, flamegpu::Messa
         const int curr_segment = FLAMEGPU->getVariable<int>("curr_segment");
         const int is_jammed = FLAMEGPU->getVariable<int>("is_jammed");
         
-        if (next_segment >= 0) {
+        const float next_retry_time = FLAMEGPU->getVariable<float>("next_retry_time");
+        if (next_segment >= 0 && current_time >= next_retry_time) {
+            int event_seq = FLAMEGPU->getVariable<int>("event_seq") + 1;
+            FLAMEGPU->setVariable<int>("event_seq", event_seq);
+            FLAMEGPU->setVariable<int>("action_type", 1);
+            FLAMEGPU->setVariable<float>("next_action_time", current_time);
             FLAMEGPU->message_out.setKey(next_segment);
             FLAMEGPU->message_out.setVariable<int>("size", packet_size);
             FLAMEGPU->message_out.setVariable<flamegpu::id_t>("agent_id", FLAMEGPU->getID());
             FLAMEGPU->message_out.setVariable<int>("from_edge", curr_segment);
             FLAMEGPU->message_out.setVariable<int>("is_jammed", is_jammed);
+            FLAMEGPU->message_out.setVariable<int>("from_node", FLAMEGPU->getVariable<int>("curr_node"));
+            FLAMEGPU->message_out.setVariable<float>("next_action_time", current_time);
+            FLAMEGPU->message_out.setVariable<int>("action_type", 1);
+            FLAMEGPU->message_out.setVariable<int>("event_seq", event_seq);
         }
         return flamegpu::ALIVE;
     }
     
+    // Event-time gating to emulate due-time scheduling.
+    const float next_event_time = FLAMEGPU->getVariable<float>("next_event_time");
+    if (next_event_time > 0.0f && current_time < next_event_time) {
+        return flamegpu::ALIVE;
+    }
+
     // Decrement remaining travel time
     float rem = FLAMEGPU->getVariable<float>("remaining_time");
     rem -= dt;
@@ -98,12 +144,21 @@ FLAMEGPU_AGENT_FUNCTION(move_and_request, flamegpu::MessageNone, flamegpu::Messa
     // This ensures curr_count is properly decremented.
     
     // Send request to enter next segment (if there is one)
-    if (next_segment >= 0) {
+    const float next_retry_time = FLAMEGPU->getVariable<float>("next_retry_time");
+    if (next_segment >= 0 && current_time >= next_retry_time) {
+        int event_seq = FLAMEGPU->getVariable<int>("event_seq") + 1;
+        FLAMEGPU->setVariable<int>("event_seq", event_seq);
+        FLAMEGPU->setVariable<int>("action_type", 1);
+        FLAMEGPU->setVariable<float>("next_action_time", current_time);
         FLAMEGPU->message_out.setKey(next_segment);
         FLAMEGPU->message_out.setVariable<int>("size", packet_size);
         FLAMEGPU->message_out.setVariable<flamegpu::id_t>("agent_id", FLAMEGPU->getID());
         FLAMEGPU->message_out.setVariable<int>("from_edge", curr_segment);
         FLAMEGPU->message_out.setVariable<int>("is_jammed", is_jammed);
+        FLAMEGPU->message_out.setVariable<int>("from_node", FLAMEGPU->getVariable<int>("curr_node"));
+        FLAMEGPU->message_out.setVariable<float>("next_action_time", current_time);
+        FLAMEGPU->message_out.setVariable<int>("action_type", 1);
+        FLAMEGPU->message_out.setVariable<int>("event_seq", event_seq);
     }
     
     return flamegpu::ALIVE;
@@ -152,6 +207,9 @@ FLAMEGPU_AGENT_FUNCTION(wait_for_entry, flamegpu::MessageBucket, flamegpu::Messa
     
     const flamegpu::id_t my_id = FLAMEGPU->getID();
     bool accepted = false;
+    int admit_status = -1;
+    float retry_time = 0.0f;
+    int reason_code = 0;
     int accepted_segment = -1;
     float accepted_travel_time = 0.0f;
     int accepted_next_segment = -1;  // Next segment in same edge, or -1 if last
@@ -161,6 +219,9 @@ FLAMEGPU_AGENT_FUNCTION(wait_for_entry, flamegpu::MessageBucket, flamegpu::Messa
     // Check if we received an acceptance message (O(1) bucket lookup by our ID)
     for (const auto& msg : FLAMEGPU->message_in(static_cast<unsigned int>(my_id))) {{
         accepted = true;
+        admit_status = msg.getVariable<int>("admit_status");
+        retry_time = msg.getVariable<float>("retry_time");
+        reason_code = msg.getVariable<int>("reason_code");
         accepted_segment = msg.getVariable<int>("edge_id");  // Actually segment_id
         accepted_travel_time = msg.getVariable<float>("travel_time");
         accepted_next_segment = msg.getVariable<int>("next_segment");
@@ -182,12 +243,44 @@ FLAMEGPU_AGENT_FUNCTION(wait_for_entry, flamegpu::MessageBucket, flamegpu::Messa
         const int curr_segment = FLAMEGPU->getVariable<int>("curr_segment");
         const int is_jammed = FLAMEGPU->getVariable<int>("is_jammed");
         
-        FLAMEGPU->message_out.setKey(next_segment);
-        FLAMEGPU->message_out.setVariable<int>("size", packet_size);
-        FLAMEGPU->message_out.setVariable<flamegpu::id_t>("agent_id", my_id);
-        FLAMEGPU->message_out.setVariable<int>("from_edge", curr_segment);
-        FLAMEGPU->message_out.setVariable<int>("is_jammed", is_jammed);
+        const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
+        const float next_retry_time = FLAMEGPU->getVariable<float>("next_retry_time");
+        if (current_time >= next_retry_time) {{
+            int event_seq = FLAMEGPU->getVariable<int>("event_seq") + 1;
+            FLAMEGPU->setVariable<int>("event_seq", event_seq);
+            FLAMEGPU->setVariable<int>("action_type", 1);
+            FLAMEGPU->setVariable<float>("next_action_time", current_time);
+            FLAMEGPU->message_out.setKey(next_segment);
+            FLAMEGPU->message_out.setVariable<int>("size", packet_size);
+            FLAMEGPU->message_out.setVariable<flamegpu::id_t>("agent_id", my_id);
+            FLAMEGPU->message_out.setVariable<int>("from_edge", curr_segment);
+            FLAMEGPU->message_out.setVariable<int>("is_jammed", is_jammed);
+            FLAMEGPU->message_out.setVariable<int>("from_node", FLAMEGPU->getVariable<int>("curr_node"));
+            FLAMEGPU->message_out.setVariable<float>("next_action_time", current_time);
+            FLAMEGPU->message_out.setVariable<int>("action_type", 1);
+            FLAMEGPU->message_out.setVariable<int>("event_seq", event_seq);
+        }}
         
+        return flamegpu::ALIVE;
+    }}
+
+    if (admit_status == 0) {{
+        // Deferred by target segment. Retry only when due.
+        FLAMEGPU->setVariable<float>("next_retry_time", retry_time);
+        return flamegpu::ALIVE;
+    }}
+    if (admit_status < 0) {{
+        if (reason_code == 5) {{
+            FLAMEGPU->setVariable<int>("is_disconnected", 1);
+        }}
+        // Explicit reject. Backoff by one step to avoid request spam.
+        const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
+        const float dt = FLAMEGPU->environment.getProperty<float>("time_step");
+        float retry = current_time + dt;
+        if (reason_code == 5) {{
+            retry = current_time + (5.0f * dt);  // disconnected cooldown
+        }}
+        FLAMEGPU->setVariable<float>("next_retry_time", retry);
         return flamegpu::ALIVE;
     }}
     
@@ -202,6 +295,12 @@ FLAMEGPU_AGENT_FUNCTION(wait_for_entry, flamegpu::MessageBucket, flamegpu::Messa
     FLAMEGPU->setVariable<int>("ready_to_move", 0);  // Reset flag - now traveling again
     FLAMEGPU->setVariable<int>("departure_sent", 0);  // Reset for next segment
     FLAMEGPU->setVariable<float>("wait_time", 0.0f);  // Reset wait time
+    FLAMEGPU->setVariable<float>("next_retry_time", 0.0f);
+    FLAMEGPU->setVariable<int>("is_disconnected", 0);
+    FLAMEGPU->setVariable<int>("action_type", 2);
+    FLAMEGPU->setVariable<int>("teleport_state", 0);
+    FLAMEGPU->setVariable<float>("teleport_resume_time", 0.0f);
+    FLAMEGPU->setVariable<int>("teleport_target_segment", -1);
     
     int route_idx = FLAMEGPU->getVariable<int>("route_idx");
     const int route_length = FLAMEGPU->getVariable<int>("route_length");
@@ -227,12 +326,13 @@ FLAMEGPU_AGENT_FUNCTION(wait_for_entry, flamegpu::MessageBucket, flamegpu::Messa
         FLAMEGPU->setVariable<int>("next_segment", -1);
     }}
     
-    // Travel time comes from acceptance message
-    FLAMEGPU->setVariable<float>("remaining_time", accepted_travel_time);
-    
     // Record entry time
     const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
+    // Travel time comes from acceptance message
+    FLAMEGPU->setVariable<float>("remaining_time", accepted_travel_time);
+    FLAMEGPU->setVariable<float>("next_event_time", current_time + accepted_travel_time);
     FLAMEGPU->setVariable<float>("entry_time", current_time);
+    FLAMEGPU->setVariable<float>("next_action_time", current_time + accepted_travel_time);
     
     return flamegpu::ALIVE;
 }}
@@ -253,7 +353,8 @@ FLAMEGPU_AGENT_FUNCTION(try_reroute, flamegpu::MessageBucket, flamegpu::MessageN
     const float reroute_threshold = 60.0f;  // Try reroute after 60s waiting
     const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
     
-    if (wait_time < reroute_threshold) {{
+    const int teleport_state = FLAMEGPU->getVariable<int>("teleport_state");
+    if (wait_time < reroute_threshold && teleport_state == 0) {{
         return flamegpu::ALIVE;  // Not stuck long enough
     }}
     
@@ -310,6 +411,10 @@ FLAMEGPU_AGENT_FUNCTION(try_reroute, flamegpu::MessageBucket, flamegpu::MessageN
     if (best_segment >= 0 && best_segment != current_next) {{
         FLAMEGPU->setVariable<int>("next_segment", best_segment);
         FLAMEGPU->setVariable<float>("wait_time", 0.0f);
+        if (teleport_state != 0) {{
+            FLAMEGPU->setVariable<int>("reroutes_while_teleporting", FLAMEGPU->getVariable<int>("reroutes_while_teleporting") + 1);
+            FLAMEGPU->setVariable<int>("teleport_target_segment", best_segment);
+        }}
     }}
     
     return flamegpu::ALIVE;
@@ -332,6 +437,7 @@ FLAMEGPU_AGENT_FUNCTION(process_edge_requests, flamegpu::MessageBucket, flamegpu
     const float free_speed = FLAMEGPU->getVariable<float>("free_speed");
     const int out_node = FLAMEGPU->getVariable<int>("out_node");
     const float current_time = FLAMEGPU->environment.getProperty<float>("current_time");
+    const float dt = FLAMEGPU->environment.getProperty<float>("time_step");
     
     // Get tau parameters for SUMO-style headway calculation
     const float tau_ff = FLAMEGPU->getVariable<float>("tau_ff");
@@ -341,25 +447,70 @@ FLAMEGPU_AGENT_FUNCTION(process_edge_requests, flamegpu::MessageBucket, flamegpu
     const int is_jammed = FLAMEGPU->getVariable<int>("is_jammed");
     float block_time = FLAMEGPU->getVariable<float>("block_time");
     
+    // Calculate travel time for this segment
+    // SUMO formula: segment_length / speed (basic, adjusted by queue if needed)
+    float travel_time = length / free_speed;
+
     // Check signal state if controlled (only last segment in edge has signal)
     const int signal_id = FLAMEGPU->getVariable<int>("signal_id");
     if (signal_id != -1) {
         const int is_green = FLAMEGPU->getVariable<int>("is_green");
         if (is_green == 0) {
-            // Red light - don't accept any requests
+            // Red light - defer all requests for next step.
+            for (const auto& msg : FLAMEGPU->message_in(segment_id)) {
+                const flamegpu::id_t req_id = msg.getVariable<flamegpu::id_t>("agent_id");
+                FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+                FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+                FLAMEGPU->message_out.setVariable<float>("retry_time", current_time + dt);
+                FLAMEGPU->message_out.setVariable<int>("reason_code", 3);  // signal red
+                FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+                FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+                FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+                FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+                FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+            }
             return flamegpu::ALIVE;
         }
     }
     
     // Calculate available space
     int available = capacity - curr_count;
+    // Minimal right-of-way gate
+    const int priority_rank = FLAMEGPU->getVariable<int>("priority_rank");
+    const int conflict_group = FLAMEGPU->getVariable<int>("conflict_group");
+    float junction_block_until = FLAMEGPU->getVariable<float>("junction_block_until");
+    if (current_time < junction_block_until) {
+        // Segment is currently blocked at junction.
+        for (const auto& msg : FLAMEGPU->message_in(segment_id)) {
+            const flamegpu::id_t req_id = msg.getVariable<flamegpu::id_t>("agent_id");
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", junction_block_until);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 4);  // junction block
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+        }
+        return flamegpu::ALIVE;
+    }
+
     if (available <= 0) {
+        for (const auto& msg : FLAMEGPU->message_in(segment_id)) {
+            const flamegpu::id_t req_id = msg.getVariable<flamegpu::id_t>("agent_id");
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", current_time + dt);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 1);  // capacity
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+        }
         return flamegpu::ALIVE;  // No space
     }
-    
-    // Calculate travel time for this segment
-    // SUMO formula: segment_length / speed (basic, adjusted by queue if needed)
-    float travel_time = length / free_speed;
     
     // Process requests (iterate messages for this segment)
     int accepted_count = 0;
@@ -369,14 +520,77 @@ FLAMEGPU_AGENT_FUNCTION(process_edge_requests, flamegpu::MessageBucket, flamegpu
         const flamegpu::id_t req_id = msg.getVariable<flamegpu::id_t>("agent_id");
         const int from_segment = msg.getVariable<int>("from_edge");  // Actually from_segment
         const int from_jammed = msg.getVariable<int>("is_jammed");
+        const int from_node = msg.getVariable<int>("from_node");
+        const float req_next_action_time = msg.getVariable<float>("next_action_time");
+        const int req_action_type = msg.getVariable<int>("action_type");
+        const int req_event_seq = msg.getVariable<int>("event_seq");
         
+        if (req_action_type != 1 || req_next_action_time > current_time + 1e-4f) {
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", req_next_action_time);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 7);  // not due yet
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+            continue;
+        }
+        
+        // Movement legality check for inter-edge entry (first segment only).
+        if (FLAMEGPU->getVariable<int>("segment_idx") == 0 && from_node >= 0 && from_node != FLAMEGPU->getVariable<int>("from_node")) {
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", -1);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", current_time + dt);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 5);  // disconnected movement
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+            continue;
+        }
+        
+        // Deterministic single-winner arbitration for contested segments.
+        if (conflict_group >= 0 && accepted_count > 0) {
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", current_time + dt);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 6);  // conflict loser
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
+            continue;
+        }
+
         // Check capacity
         if (accepted_count + req_size > available) {
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", current_time + dt);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 1);  // capacity
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
             continue;  // No more space
         }
         
         // Check headway (block_time) - SUMO meso style
         if (current_time < block_time) {
+            FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+            FLAMEGPU->message_out.setVariable<int>("admit_status", 0);
+            FLAMEGPU->message_out.setVariable<float>("retry_time", block_time);
+            FLAMEGPU->message_out.setVariable<int>("reason_code", 2);  // headway
+            FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);
+            FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
+            FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
+            FLAMEGPU->message_out.setVariable<int>("next_segment", next_segment);
+            FLAMEGPU->message_out.setVariable<int>("edge_idx", edge_idx);
             continue;  // Must wait for headway
         }
         
@@ -403,6 +617,9 @@ FLAMEGPU_AGENT_FUNCTION(process_edge_requests, flamegpu::MessageBucket, flamegpu
         
         // Send acceptance message with segment info
         FLAMEGPU->message_out.setKey(static_cast<unsigned int>(req_id));
+        FLAMEGPU->message_out.setVariable<int>("admit_status", 1);
+        FLAMEGPU->message_out.setVariable<float>("retry_time", current_time);
+        FLAMEGPU->message_out.setVariable<int>("reason_code", 0);
         FLAMEGPU->message_out.setVariable<int>("edge_id", segment_id);  // Actually segment_id
         FLAMEGPU->message_out.setVariable<float>("travel_time", travel_time);
         FLAMEGPU->message_out.setVariable<int>("out_node", out_node);
@@ -412,6 +629,9 @@ FLAMEGPU_AGENT_FUNCTION(process_edge_requests, flamegpu::MessageBucket, flamegpu
     
     // Update block_time
     FLAMEGPU->setVariable<float>("block_time", block_time);
+    if (conflict_group >= 0) {
+        FLAMEGPU->setVariable<float>("junction_block_until", block_time + (priority_rank > 0 ? 0.0f : dt));
+    }
     
     // Update segment count
     FLAMEGPU->setVariable<int>("curr_count", curr_count + accepted_count);
@@ -473,13 +693,22 @@ FLAMEGPU_AGENT_FUNCTION(process_departures, flamegpu::MessageBucket, flamegpu::M
     // Calculate mean speed based on jam state
     // In free-flow: use free_speed
     // In jam: speed decreases proportionally to congestion above threshold
+    const int fd_runtime_mode = FLAMEGPU->environment.getProperty<int>("fd_runtime_mode");
     float speed;
-    if (is_jammed == 0) {
+    if (fd_runtime_mode == 1) {
+        // Branch-light Newell-Daganzo style piecewise speed approximation.
+        const float critical = jam_threshold;
+        if (occupancy <= critical) {
+            speed = free_speed;
+        } else {
+            float k = (occupancy - critical) / (1.0f - critical);
+            speed = free_speed * (1.0f - 0.8f * k);
+        }
+    } else if (is_jammed == 0) {
         speed = free_speed;
     } else {
-        // Linear decrease from free_speed at jam_threshold to min_speed at capacity
         float congestion_factor = (occupancy - jam_threshold) / (1.0f - jam_threshold);
-        speed = free_speed * (1.0f - 0.7f * congestion_factor);  // Down to 30% at full
+        speed = free_speed * (1.0f - 0.7f * congestion_factor);
     }
     if (speed < 1.0f) speed = 1.0f;  // Minimum speed
     
@@ -499,7 +728,7 @@ FLAMEGPU_AGENT_FUNCTION(process_departures, flamegpu::MessageBucket, flamegpu::M
 """
 
 UPDATE_SIGNAL_CODE = """
-FLAMEGPU_AGENT_FUNCTION(update_signal, flamegpu::MessageNone, flamegpu::MessageBruteForce) {
+FLAMEGPU_AGENT_FUNCTION(update_signal, flamegpu::MessageNone, flamegpu::MessageBucket) {
     const float dt = FLAMEGPU->environment.getProperty<float>("time_step");
     float time_left = FLAMEGPU->getVariable<float>("time_to_phase_end");
     int phase_index = FLAMEGPU->getVariable<int>("phase_index");
@@ -531,6 +760,7 @@ FLAMEGPU_AGENT_FUNCTION(update_signal, flamegpu::MessageNone, flamegpu::MessageB
     for (int i = 0; i < max_edges_per_phase; i++) {
         int edge_id = FLAMEGPU->getVariable<int, 512>("phase_green_edges", phase_index * max_edges_per_phase + i);
         if (edge_id >= 0) {
+            FLAMEGPU->message_out.setKey(edge_id);
             FLAMEGPU->message_out.setVariable<int>("edge_id", edge_id);
             FLAMEGPU->message_out.setVariable<int>("node_id", node_id);
         }
@@ -541,7 +771,7 @@ FLAMEGPU_AGENT_FUNCTION(update_signal, flamegpu::MessageNone, flamegpu::MessageB
 """
 
 UPDATE_GREEN_FLAG_CODE = """
-FLAMEGPU_AGENT_FUNCTION(update_green_flag, flamegpu::MessageBruteForce, flamegpu::MessageNone) {
+FLAMEGPU_AGENT_FUNCTION(update_green_flag, flamegpu::MessageBucket, flamegpu::MessageNone) {
     const int edge_id = FLAMEGPU->getVariable<int>("edge_id");
     const int signal_id = FLAMEGPU->getVariable<int>("signal_id");
     
@@ -553,7 +783,7 @@ FLAMEGPU_AGENT_FUNCTION(update_green_flag, flamegpu::MessageBruteForce, flamegpu
     
     // Check if we received a green signal
     int is_green = 0;
-    for (const auto& msg : FLAMEGPU->message_in) {
+    for (const auto& msg : FLAMEGPU->message_in(edge_id)) {
         if (msg.getVariable<int>("edge_id") == edge_id) {
             is_green = 1;
             break;
@@ -718,13 +948,16 @@ def define_edge_queue_agent(model, config: Optional[EdgeQueueConfig] = None):
     agent.newVariableInt("from_node", -1)      # Only meaningful for first segment
     agent.newVariableInt("out_node")           # Only meaningful for last segment
     agent.newVariableInt("lane_count", 1)
+    agent.newVariableInt("priority_rank", 0)      # Larger number = higher priority
+    agent.newVariableInt("conflict_group", -1)    # Optional shared conflict namespace
+    agent.newVariableFloat("junction_block_until", 0.0)
     
     # SUMO Mesoscopic 4-tau headway parameters
     agent.newVariableFloat("tau_ff", 1.4)       # Free-flow to free-flow headway [s]
     agent.newVariableFloat("tau_fj", 1.4)       # Free-flow to jammed headway [s]
     agent.newVariableFloat("tau_jf", 2.0)       # Jammed to free-flow headway [s]
-    agent.newVariableFloat("tau_jj", 2.0)       # Jammed to jammed headway [s]
-    agent.newVariableFloat("jam_threshold", 0.5)  # Occupancy threshold for jammed state
+    agent.newVariableFloat("tau_jj", 1.4)       # Jammed to jammed headway [s]
+    agent.newVariableFloat("jam_threshold", 0.8)  # Occupancy threshold for jammed state
     agent.newVariableFloat("block_time", 0.0)   # Time when next vehicle can enter
     agent.newVariableInt("is_jammed", 0)        # Current jam state (0=free, 1=jammed)
     
@@ -798,6 +1031,20 @@ def define_packet_agent(model, config: Optional[PacketConfig] = None):
     agent.newVariableInt("curr_node", -1)     # Current node for rerouting
     agent.newVariableInt("dest_node", -1)     # Destination node for rerouting
     agent.newVariableInt("is_jammed", 0)      # Current segment jam state (for 4-tau)
+    agent.newVariableFloat("next_retry_time", 0.0)
+    agent.newVariableFloat("next_event_time", 0.0)
+    agent.newVariableFloat("next_action_time", 0.0)
+    agent.newVariableInt("action_type", 0)     # 1=request,2=travel
+    agent.newVariableInt("event_seq", 0)
+    agent.newVariableInt("teleport_reason", 0)  # 0=none,1=jam,2=disconnected,3=route_end
+    agent.newVariableInt("is_disconnected", 0)
+    agent.newVariableInt("teleport_state", 0)  # 0=none,1=single_jump,2=multi_step,3=removed
+    agent.newVariableFloat("teleport_resume_time", 0.0)
+    agent.newVariableInt("teleport_target_segment", -1)
+    agent.newVariableInt("teleport_hops", 0)
+    agent.newVariableInt("teleport_single_count", 0)
+    agent.newVariableInt("teleport_multi_count", 0)
+    agent.newVariableInt("reroutes_while_teleporting", 0)
     
     # Route array (fixed size) - contains segment indices in segment mode, edge indices otherwise
     agent.newVariableArrayInt("route", config.max_route_length)

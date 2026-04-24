@@ -747,3 +747,18 @@ def create_fundamental_diagram(model_type: str,
     
     return models[model_type](params, **kwargs)
 
+
+def runtime_fd_constants(params: FundamentalDiagramParameters) -> Dict[str, float]:
+    """
+    Emit branch-light runtime constants for src/core GPU kernels.
+
+    This keeps rich analytical models offline; runtime consumes only scalar constants.
+    """
+    return {
+        "v_free": float(params.v_free),
+        "rho_jam": float(params.rho_jam),
+        "rho_crit": float(params.rho_crit),
+        "q_max": float(params.q_max),
+        "w": float(params.w),
+    }
+

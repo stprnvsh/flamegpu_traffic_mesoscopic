@@ -1,0 +1,89 @@
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+	<input>
+        <net-file value="arbon.net.xml" />
+        <additional-files value="additional.add.xml,taz.xml" />
+        <route-files value="trips_0_24.trips.xml" />
+	</input>
+
+    <output>
+        <vehroute-output value="routes_WARB.xml" />
+        <vehroute-output.route-length value="true" />
+        <vehroute-output.last-route value="true" />
+        <vehroute-output.write-unfinished value="true" />
+        <vehroute-output.exit-times value="true" />
+        <vehroute-output.skip-ptlines value="true" />
+        <summary-output value="./summary.out.xml" />
+        <summary-output.period value="900" />
+        <fcd-output value="fcd_out.parquet" />
+        <fcd-output.geo value="true" />
+        <fcd-output.attributes value="id,type,edge,queue,segment,pos,x,y,angle,speed,entryTime"/>
+    </output>
+
+    <time>
+        <step-length value="1" />
+        <begin value="0"/>
+        <end value="86400"/>
+    </time>
+
+ <processing>
+        <random-depart-offset value="0" />
+        <no-internal-links value="true" />
+        <ignore-junction-blocker value="1" />
+        <ignore-route-errors value="true" />
+        <time-to-impatience value="7" />
+        <scale value="1" />
+        <time-to-teleport.disconnected value="1" />
+        <time-to-teleport value="180" />
+        <threads value="1" />
+</processing>
+
+    <routing>
+        <routing-algorithm value="astar" />
+        <weights.random-factor value="1.0" />
+	    <weights.priority-factor value="0.5" />
+        <device.rerouting.probability value="0.7" />
+        <device.rerouting.period value="60" />
+        <device.rerouting.pre-period value="0" />
+        <device.rerouting.adaptation-steps value="2" />
+        <device.rerouting.adaptation-interval value="20" />
+        <device.rerouting.with-taz value="false" />
+        <device.rerouting.threads value="1" />
+        <device.rerouting.synchronize value="false" />
+        <device.rerouting.threshold.factor value="1.1" />
+        <device.rerouting.threshold.constant value="300" />
+    </routing>
+
+    <report>
+        <verbose value="true" />
+        <xml-validation value="never" />
+        <no-warnings value="true" />
+        <error-log value="log.log" />
+    </report>
+
+    <mesoscopic>
+        <mesosim value="true" />
+        <meso-edgelength value="21" />
+        <meso-tauff value="1.35" />
+        <meso-taufj value="1.51" />
+        <meso-taujf value="1.75" />
+        <meso-taujj value="1.55" />
+        <meso-jam-threshold value="-0.83" />
+        <meso-multi-queue value="true" />
+        <meso-junction-control value="true" />
+        <meso-tls-penalty value="0" />
+	<meso-tls-flow-penalty value="0" />
+        <meso-minor-penalty value="2" />
+        <meso-overtaking value="true" />
+        <meso-lane-queue value="true" />
+    </mesoscopic>
+
+    <random_number>
+		<seed value="17" />
+    </random_number>
+
+    <gui_only>
+        <tracker-interval value="2" />
+    </gui_only>
+
+</configuration>

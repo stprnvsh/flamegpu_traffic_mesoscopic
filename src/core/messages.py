@@ -43,28 +43,31 @@ def define_messages(model, config: Optional[MessageConfig] = None):
     messages = {}
     
     # =========================================================================
-    # 1. Entry Request Message (Bucket by edge_id)
+    # 1. Entry Request Message (Bucket by segment_id)
     # =========================================================================
-    # Sent by Packets to request entry to an edge
-    # Keyed by target edge_id for efficient lookup
+    # Sent by Packets to request entry to a SEGMENT
+    # Keyed by target segment_id for efficient lookup
     msg_request = model.newMessageBucket("entry_request")
-    msg_request.setUpperBound(config.max_edges - 1)
+    msg_request.setUpperBound(config.max_edges - 1)       # Now max segments
     msg_request.newVariableInt("size")                    # Packet size (vehicles)
     msg_request.newVariableID("agent_id")                 # Requesting packet's ID
-    msg_request.newVariableInt("from_edge")               # Origin edge (for priority)
+    msg_request.newVariableInt("from_edge")               # Origin segment (for headway calc)
+    msg_request.newVariableInt("is_jammed")               # Origin segment jam state (for 4-tau)
     messages["entry_request"] = msg_request
     
     # =========================================================================
     # 2. Entry Accept Message (Bucket by agent_id)
     # =========================================================================
-    # Sent by EdgeQueue to accepted Packets
+    # Sent by Segment to accepted Packets
     # Bucket keyed by requesting packet's agent_id for O(1) lookup
-    # Includes travel_time so packets don't need to look up env arrays (scales to any network)
+    # Includes segment info so packets know where to go next
     msg_accept = model.newMessageBucket("entry_accept")
-    msg_accept.setUpperBound(2000000)  # Max concurrent packets (agent IDs can grow with large demand)
-    msg_accept.newVariableInt("edge_id")                  # Edge that accepted
-    msg_accept.newVariableFloat("travel_time")            # Current travel time for this edge
-    msg_accept.newVariableInt("out_node")                 # Destination node of this edge (for rerouting)
+    msg_accept.setUpperBound(2000000)  # Max concurrent packets
+    msg_accept.newVariableInt("edge_id")                  # Segment ID (index in segment list)
+    msg_accept.newVariableFloat("travel_time")            # Travel time for this segment
+    msg_accept.newVariableInt("out_node")                 # End node (for rerouting)
+    msg_accept.newVariableInt("next_segment")             # Next segment in same edge (-1 if last)
+    msg_accept.newVariableInt("edge_idx")                 # Parent edge index (for metrics)
     messages["entry_accept"] = msg_accept
     
     # =========================================================================
@@ -88,6 +91,8 @@ def define_messages(model, config: Optional[MessageConfig] = None):
     msg_status.newVariableInt("to_node")                   # Where this edge leads
     msg_status.newVariableInt("available_capacity")        # How much space left
     msg_status.newVariableFloat("travel_time")             # Current travel time
+    msg_status.newVariableInt("is_jammed")                 # Jam state (0/1) for routing
+    msg_status.newVariableFloat("block_time")              # When edge can accept next vehicle
     messages["edge_status"] = msg_status
     
     # =========================================================================

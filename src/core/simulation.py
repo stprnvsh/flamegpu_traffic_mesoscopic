@@ -33,6 +33,10 @@ from .model import (
     create_logging_function,
     create_rerouting_function,
 )
+from .metrics import (
+    MetricsConfig,
+    create_edge_data_function,
+)
 
 
 @dataclass
@@ -44,9 +48,14 @@ class SimulationConfig:
     warmup_time: float = 0.0              # Warmup period (no logging)
     
     # Output settings
-    output_interval: float = 3600.0         # Interval for logging [seconds]
+    output_interval: float = 60.0         # Interval for console logging [seconds]
     output_dir: str = "./output"          # Output directory
-    output_format: str = "csv"            # 'csv' or 'xml'
+    output_format: str = "parquet"        # 'parquet', 'csv' or 'json'
+    
+    # Metrics collection settings
+    metrics_interval: float = 900.0       # Interval for metrics aggregation [seconds]
+    metrics_file: str = "simulation_metrics.parquet"  # Metrics output file
+    collect_edge_metrics: bool = True     # Collect per-edge metrics
     
     # GPU settings
     device_id: int = 0                    # CUDA device ID
@@ -67,6 +76,23 @@ class SimulationConfig:
     rerouting_enabled: bool = False       # Enable dynamic rerouting
     rerouting_period: float = 60.0        # Rerouting check interval [s]
     rerouting_probability: float = 0.7    # Fraction of vehicles that can reroute
+
+
+@dataclass
+class SegmentData:
+    """Data for a single segment (SUMO meso-style ~100m chunks)"""
+    segment_id: str                       # Format: "edge_id:segment_idx"
+    edge_id: str                          # Parent edge ID
+    edge_idx: int                         # Parent edge index
+    segment_idx: int                      # Segment index within edge (0, 1, 2...)
+    length: float                         # Segment length [m]
+    speed: float                          # Speed limit [m/s]
+    capacity: int                         # Max vehicles
+    lanes: int                            # Number of lanes
+    next_segment: int                     # Next segment index (-1 if last in edge)
+    from_node: int                        # Start node index
+    to_node: int                          # End node index (only meaningful for last segment)
+    signal_id: int                        # Signal ID (-1 if none, only for last segment)
 
 
 @dataclass
@@ -91,6 +117,13 @@ class NetworkData:
     node_adjacency: Dict[int, List[int]] = field(default_factory=dict)  # For rerouting
     signals: List[Dict[str, Any]] = field(default_factory=list)  # Signal definitions
     
+    # Segment data (for SUMO meso compatibility)
+    segments: List[SegmentData] = field(default_factory=list)  # Segment list
+    segment_id_map: Dict[str, int] = field(default_factory=dict)  # segment_id -> index
+    edge_to_segments: Dict[int, List[int]] = field(default_factory=dict)  # edge_idx -> [segment indices]
+    edge_first_segment: List[int] = field(default_factory=list)  # edge_idx -> first segment index
+    edge_last_segment: List[int] = field(default_factory=list)   # edge_idx -> last segment index
+    
     @property
     def num_edges(self) -> int:
         return len(self.edge_ids)
@@ -102,6 +135,10 @@ class NetworkData:
     @property
     def num_signals(self) -> int:
         return len(self.signals)
+    
+    @property
+    def num_segments(self) -> int:
+        return len(self.segments)
 
 
 @dataclass
@@ -151,6 +188,7 @@ class MesoscopicSimulation:
         self.demand = None
         self._initialized = False
         self._results = {}
+        self._metrics_function = None
         
     def build_model(self, model_config: Optional[ModelConfig] = None, max_route_length: Optional[int] = None):
         """
@@ -231,7 +269,22 @@ class MesoscopicSimulation:
         
         # Add standard host functions
         self.model.add_step_function(create_time_update_function())
+        
+        # Console logging (frequent, for monitoring)
         self.model.add_step_function(create_logging_function(self.config.output_interval))
+        
+        # Metrics collection for parquet output (less frequent)
+        from .metrics import create_edge_data_function
+        self._metrics_function = create_edge_data_function(
+            output_interval=self.config.metrics_interval,
+            edge_ids=self.network.edge_ids,
+            edge_lengths=self.network.edge_lengths,
+            edge_lanes=self.network.edge_lanes,
+            edge_speeds=self.network.edge_speeds,
+            output_file=self.config.metrics_file
+        )
+        if self._metrics_function:
+            self.model.add_step_function(self._metrics_function)
         
         # Add spawn function BEFORE creating CUDASimulation (model gets compiled at that point)
         spawn_func = create_spawn_packets_function(
@@ -240,7 +293,10 @@ class MesoscopicSimulation:
             self.network.edge_lengths,
             self.network.edge_speeds,
             self.network.edge_to_nodes,  # For GPU-side rerouting (dest_node)
-            max_route_length  # Pass the calculated max route length
+            max_route_length,  # Pass the calculated max route length
+            # Segment data for SUMO meso compatibility
+            edge_first_segment=self.network.edge_first_segment if self.network.segments else None,
+            segments=self.network.segments if self.network.segments else None,
         )
         if spawn_func:
             self.model.add_step_function(spawn_func)
@@ -274,32 +330,103 @@ class MesoscopicSimulation:
             print("Simulation initialized")
     
     def _create_edge_agents(self):
-        """Create EdgeQueue agents from network data"""
+        """Create EdgeQueue (Segment) agents from network data
+        
+        Note: EdgeQueue agents now represent SEGMENTS (~100m), not full edges.
+        This matches SUMO's mesoscopic model for better traffic flow.
+        """
         import pyflamegpu
         
         # Get agent description from model
         agent_desc = self.model.model.getAgent("EdgeQueue")
         
-        # Create population
-        num_edges = len(self.network.edge_ids)
-        pop = pyflamegpu.AgentVector(agent_desc, num_edges)
-        
-        for i in range(num_edges):
-            agent = pop[i]
-            agent.setVariableInt("edge_id", i)
-            agent.setVariableInt("capacity", self.network.edge_capacities[i])
-            agent.setVariableInt("curr_count", 0)
-            agent.setVariableFloat("length", self.network.edge_lengths[i])
-            agent.setVariableFloat("free_speed", self.network.edge_speeds[i])
-            agent.setVariableInt("signal_id", self.network.edge_signal_ids[i])
-            agent.setVariableInt("is_green", 1)  # Default to green
-            travel_time = self.network.edge_lengths[i] / self.network.edge_speeds[i] if self.network.edge_speeds[i] > 0 else 1.0
-            agent.setVariableFloat("travel_time", travel_time)
-            # Node info for GPU-side rerouting
-            from_node = self.network.edge_from_nodes[i] if i < len(self.network.edge_from_nodes) else -1
-            agent.setVariableInt("from_node", from_node)
-            agent.setVariableInt("out_node", self.network.edge_to_nodes[i])
-            agent.setVariableInt("lane_count", self.network.edge_lanes[i])
+        # Check if we have segment data
+        if self.network.segments:
+            # Use segment-based approach (SUMO meso style)
+            num_segments = len(self.network.segments)
+            print(f"Creating {num_segments} segment agents (from {len(self.network.edge_ids)} edges)")
+            pop = pyflamegpu.AgentVector(agent_desc, num_segments)
+            
+            # Get tau parameters from config
+            tau_ff = getattr(self.config, 'tau_ff', 1.4)
+            tau_fj = getattr(self.config, 'tau_fj', 1.4)
+            tau_jf = getattr(self.config, 'tau_jf', 2.0)
+            tau_jj = getattr(self.config, 'tau_jj', 2.0)
+            
+            for i, seg in enumerate(self.network.segments):
+                agent = pop[i]
+                agent.setVariableInt("edge_id", i)  # Segment index as ID
+                agent.setVariableInt("edge_idx", seg.edge_idx)  # Parent edge
+                agent.setVariableInt("segment_idx", seg.segment_idx)  # Segment position in edge
+                agent.setVariableInt("next_segment", seg.next_segment)  # Next segment (-1 if last)
+                agent.setVariableInt("capacity", seg.capacity)
+                agent.setVariableInt("curr_count", 0)
+                agent.setVariableFloat("length", seg.length)
+                agent.setVariableFloat("free_speed", seg.speed)
+                agent.setVariableInt("signal_id", seg.signal_id)
+                agent.setVariableInt("is_green", 1)
+                travel_time = seg.length / seg.speed if seg.speed > 0 else 1.0
+                agent.setVariableFloat("travel_time", travel_time)
+                agent.setVariableInt("from_node", seg.from_node)
+                agent.setVariableInt("out_node", seg.to_node)
+                agent.setVariableInt("lane_count", seg.lanes)
+                
+                # SUMO Mesoscopic 4-tau headway parameters
+                agent.setVariableFloat("tau_ff", tau_ff)
+                agent.setVariableFloat("tau_fj", tau_fj)
+                agent.setVariableFloat("tau_jf", tau_jf)
+                agent.setVariableFloat("tau_jj", tau_jj)
+                
+                agent.setVariableFloat("jam_threshold", 0.5)
+                agent.setVariableFloat("block_time", 0.0)
+                agent.setVariableInt("is_jammed", 0)
+                
+                # Interval metrics
+                agent.setVariableFloat("interval_sampled_seconds", 0.0)
+                agent.setVariableInt("interval_entered", 0)
+                agent.setVariableInt("interval_left", 0)
+        else:
+            # Fallback: use edge-based approach (old behavior)
+            num_edges = len(self.network.edge_ids)
+            print(f"Creating {num_edges} edge agents (no segment data)")
+            pop = pyflamegpu.AgentVector(agent_desc, num_edges)
+            
+            tau_ff = getattr(self.config, 'tau_ff', 1.4)
+            tau_fj = getattr(self.config, 'tau_fj', 1.4)
+            tau_jf = getattr(self.config, 'tau_jf', 2.0)
+            tau_jj = getattr(self.config, 'tau_jj', 2.0)
+            
+            for i in range(num_edges):
+                agent = pop[i]
+                agent.setVariableInt("edge_id", i)
+                agent.setVariableInt("edge_idx", i)  # Edge index = segment index in fallback
+                agent.setVariableInt("segment_idx", 0)  # Only one "segment" per edge
+                agent.setVariableInt("next_segment", -1)  # No next segment
+                agent.setVariableInt("capacity", self.network.edge_capacities[i])
+                agent.setVariableInt("curr_count", 0)
+                agent.setVariableFloat("length", self.network.edge_lengths[i])
+                agent.setVariableFloat("free_speed", self.network.edge_speeds[i])
+                agent.setVariableInt("signal_id", self.network.edge_signal_ids[i])
+                agent.setVariableInt("is_green", 1)
+                travel_time = self.network.edge_lengths[i] / self.network.edge_speeds[i] if self.network.edge_speeds[i] > 0 else 1.0
+                agent.setVariableFloat("travel_time", travel_time)
+                from_node = self.network.edge_from_nodes[i] if i < len(self.network.edge_from_nodes) else -1
+                agent.setVariableInt("from_node", from_node)
+                agent.setVariableInt("out_node", self.network.edge_to_nodes[i])
+                agent.setVariableInt("lane_count", self.network.edge_lanes[i])
+                
+                agent.setVariableFloat("tau_ff", tau_ff)
+                agent.setVariableFloat("tau_fj", tau_fj)
+                agent.setVariableFloat("tau_jf", tau_jf)
+                agent.setVariableFloat("tau_jj", tau_jj)
+                
+                agent.setVariableFloat("jam_threshold", 0.5)
+                agent.setVariableFloat("block_time", 0.0)
+                agent.setVariableInt("is_jammed", 0)
+                
+                agent.setVariableFloat("interval_sampled_seconds", 0.0)
+                agent.setVariableInt("interval_entered", 0)
+                agent.setVariableInt("interval_left", 0)
         
         # Add population to simulation
         self.simulation.setPopulationData(pop)
@@ -353,7 +480,7 @@ class MesoscopicSimulation:
     
     def run(self, duration: Optional[float] = None) -> Dict[str, Any]:
         """
-        Run the simulation
+        Run the simulation with interval-based data collection
         
         Args:
             duration: Optional override for simulation duration
@@ -364,25 +491,68 @@ class MesoscopicSimulation:
         if not self._initialized:
             raise RuntimeError("Simulation not initialized. Call initialize() first.")
         
-        if duration is not None:
-            steps = int(duration / self.config.time_step)
-            self.simulation.SimulationConfig().steps = steps
+        sim_duration = duration or self.config.duration
+        total_steps = int(sim_duration / self.config.time_step)
+        steps_per_interval = int(self.config.metrics_interval / self.config.time_step)
         
         if self.config.verbose:
-            print(f"Starting simulation for {self.config.duration}s...")
+            print(f"Starting simulation for {sim_duration}s...")
             start_time = time.time()
         
-        # Run simulation
-        self.simulation.simulate()
+        # Create interval data collector for per-edge per-interval data
+        from .metrics import IntervalEdgeDataCollector
+        self._interval_collector = IntervalEdgeDataCollector(
+            simulation=self.simulation,
+            model=self.model,
+            network_data=self.network,
+            output_interval=self.config.metrics_interval,
+            output_file=self.config.metrics_file
+        )
+        
+        # Run step-by-step to collect interval data
+        import pyflamegpu
+        step = 0
+        next_collection = steps_per_interval
+        
+        while step < total_steps:
+            # Check if we need to collect BEFORE this step (so we get data before reset)
+            if step == next_collection:
+                current_time = step * self.config.time_step
+                self._interval_collector.collect(current_time)
+                self._interval_collector.last_collection_time = current_time  # Update for next interval
+                next_collection += steps_per_interval
+                # Set reset flag for THIS step
+                self.simulation.setEnvironmentPropertyInt("reset_interval_counters", 1)
+                # Reset spawn tracker for next interval
+                try:
+                    from .model import SpawnTracker
+                    SpawnTracker.get_instance().reset()
+                except ImportError:
+                    pass
+            else:
+                # Clear reset flag
+                self.simulation.setEnvironmentPropertyInt("reset_interval_counters", 0)
+            
+            # Run one step
+            self.simulation.step()
+            step += 1
+        
+        # Collect final partial interval if any
+        final_time = step * self.config.time_step
+        if final_time > self._interval_collector.last_collection_time:
+            self._interval_collector.collect(final_time)
+            self._interval_collector.last_collection_time = final_time
         
         if self.config.verbose:
             elapsed = time.time() - start_time
-            sim_time = self.config.duration
             print(f"Simulation completed in {elapsed:.2f}s "
-                  f"({sim_time/elapsed:.1f}x real-time)")
+                  f"({sim_duration/elapsed:.1f}x real-time)")
         
-        # Collect results
+        # Collect final results
         self._collect_results()
+        
+        # Save all metrics to Parquet
+        self._interval_collector.save(self.config.metrics_file)
         
         return self._results
     
@@ -457,20 +627,88 @@ class MesoscopicSimulation:
                 return pop.size()
         return 0
     
-    def export_results(self, filepath: str):
+    def export_results(self, filepath: str, format: str = None):
         """
         Export results to file
         
         Args:
             filepath: Output file path
+            format: Output format ('json', 'parquet'). Auto-detected from extension if None.
         """
-        import json
+        if format is None:
+            if filepath.endswith('.parquet'):
+                format = 'parquet'
+            else:
+                format = 'json'
         
-        with open(filepath, 'w') as f:
-            json.dump(self._results, f, indent=2)
+        if format == 'parquet':
+            try:
+                import pandas as pd
+                # Convert results to DataFrame-friendly format
+                summary = {k: v for k, v in self._results.items() if k != 'edge_stats'}
+                df = pd.DataFrame([summary])
+                df.to_parquet(filepath.replace('.parquet', '_summary.parquet'), index=False)
+                
+                # Save edge stats separately
+                if 'edge_stats' in self._results:
+                    df_edges = pd.DataFrame(self._results['edge_stats'])
+                    df_edges.to_parquet(filepath.replace('.parquet', '_edges_final.parquet'), index=False)
+                
+                if self.config.verbose:
+                    print(f"Results exported to {filepath}")
+            except ImportError:
+                print("pandas not available, falling back to JSON")
+                format = 'json'
         
-        if self.config.verbose:
-            print(f"Results exported to {filepath}")
+        if format == 'json':
+            import json
+            with open(filepath, 'w') as f:
+                json.dump(self._results, f, indent=2)
+            if self.config.verbose:
+                print(f"Results exported to {filepath}")
+    
+    def get_metrics_dataframe(self):
+        """
+        Get network-level metrics as a pandas DataFrame
+        
+        Returns:
+            pandas DataFrame with time-series network metrics, or None if not available
+        """
+        if hasattr(self, '_interval_collector') and self._interval_collector:
+            return self._interval_collector.get_network_dataframe()
+        return None
+    
+    def get_edge_data(self):
+        """
+        Get per-edge metrics as a pandas DataFrame (SUMO edgeData style)
+        
+        Columns include:
+        - edge_id: Original edge ID  
+        - vehicle_count: Vehicles on edge
+        - density: Vehicles per km per lane
+        - occupancy: Fraction of capacity used
+        - speed: Average speed [m/s]
+        - speed_relative: Speed relative to free flow
+        - flow: Vehicles per hour
+        - travel_time: Average travel time [s]
+        
+        Returns:
+            pandas DataFrame with per-edge metrics, or None if not available
+        """
+        # Return per-edge per-interval data from collector
+        if hasattr(self, '_interval_collector') and self._interval_collector:
+            return self._interval_collector.get_edge_dataframe()
+        return None
+    
+    def save_metrics(self, filepath: str = None):
+        """
+        Save collected metrics to Parquet files
+        
+        Args:
+            filepath: Output path (defaults to config.metrics_file)
+        """
+        # Saving is handled by the interval collector in run()
+        pass
 
 
 # =============================================================================

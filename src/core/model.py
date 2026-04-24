@@ -165,37 +165,51 @@ class MesoscopicTrafficModel:
         env.newPropertyFloat("tau_jf", cfg.tau_jf)
         env.newPropertyFloat("tau_jj", cfg.tau_jj)
         
-        # NOTE: Edge property arrays removed - they cause CUDA JIT errors on sm_120+
-        # All edge data is stored in EdgeQueue agent variables instead:
-        # - length, free_speed, capacity, travel_time are EdgeQueue variables
-        # - Packets receive travel_time through acceptance messages
+        # Interval metrics reset flag (set by host function to trigger reset)
+        env.newPropertyInt("reset_interval_counters", 0)
+        
+        # Routing parameters
+        env.newPropertyFloat("reroute_threshold", 60.0)  # Seconds waiting before reroute
+        env.newPropertyFloat("adaptation_weight", 0.5)   # Exponential smoothing for edge weights
+        env.newPropertyInt("reroute_enabled", 1)         # Enable/disable rerouting
+        
+        # NOTE: Graph topology stored in EdgeQueue agents and broadcast via messages
+        # This avoids CUDA JIT errors with large environment arrays on sm_120+
+        # Edges broadcast: edge_id, from_node, to_node, travel_time, is_jammed
+        # Packets read edge_status messages keyed by curr_node for alternatives
         
     def _define_layers(self):
         """
         Define execution layers to control agent function ordering
         
-        Execution order per step:
-        1. L1_departure - Packets send departure notices
-        2. L2_process_departures - Edges process departures
-        3. L3_move - Packets move and send entry requests
+        Execution order per step (SUMO-compatible mesoscopic model):
+        1. L1_move - Packets decrement travel time, request entry when done
+        2. L2_departure - Packets send departure notices 
+        3. L3_process_departures - Edges process departures, update jam state (is_jammed)
         4. L4_signal - Signals update phases and broadcast green
-        5. L5_green_flag - Edges update green flags
-        6. L6_broadcast - Edges broadcast status (for GPU rerouting)
-        7. L7_reroute - Stuck packets try to find alternatives
-        8. L8_process_requests - Edges process entry requests
+        5. L5_green_flag - Edges update green flags from signals
+        6. L6_broadcast - Edges broadcast status with jam state (for rerouting)
+        7. L7_reroute - Stuck packets try to find alternatives (jam-aware)
+        8. L8_process_requests - Edges process requests with 4-tau headway model
         9. L9_wait - Waiting packets check for acceptance
+        10. L10_reset_counters - Reset interval metrics (SUMO edgeData style)
         """
-        # Layer 1: Packets send departure notices (traveling state)
-        layer1 = self.model.newLayer("L1_departure")
-        layer1.addAgentFunction("Packet", "send_departure")
+        # Layer 0: Reset interval counters FIRST (if triggered by host)
+        # This ensures counters are reset at START of new interval, not end
+        layer0 = self.model.newLayer("L0_reset_counters")
+        layer0.addAgentFunction("EdgeQueue", "reset_interval_counters")
         
-        # Layer 2: Edges process departures
-        layer2 = self.model.newLayer("L2_process_departures")
-        layer2.addAgentFunction("EdgeQueue", "process_departures")
+        # Layer 1: Packets move and request entry (traveling → waiting)
+        layer1 = self.model.newLayer("L1_move")
+        layer1.addAgentFunction("Packet", "move_and_request")
         
-        # Layer 3: Packets move and request entry (traveling → waiting)
-        layer3 = self.model.newLayer("L3_move")
-        layer3.addAgentFunction("Packet", "move_and_request")
+        # Layer 2: Packets send departure notices (after move sets ready_to_move=1)
+        layer2 = self.model.newLayer("L2_departure")
+        layer2.addAgentFunction("Packet", "send_departure")
+        
+        # Layer 3: Edges process departures
+        layer3 = self.model.newLayer("L3_process_departures")
+        layer3.addAgentFunction("EdgeQueue", "process_departures")
         
         # Layer 4: Signals update and broadcast green
         layer4 = self.model.newLayer("L4_signal")
@@ -221,7 +235,7 @@ class MesoscopicTrafficModel:
         layer9 = self.model.newLayer("L9_wait")
         layer9.addAgentFunction("Packet", "wait_for_entry")
         
-        self.layers = [layer1, layer2, layer3, layer4, layer5, layer6, layer7, layer8, layer9]
+        self.layers = [layer0, layer1, layer2, layer3, layer4, layer5, layer6, layer7, layer8, layer9]
     
     def add_init_function(self, func: Callable):
         """Add an initialization function"""
@@ -297,19 +311,46 @@ def create_time_update_function():
     return TimeUpdateFunction()
 
 
+class SpawnTracker:
+    """Tracks spawned vehicle counts per segment for metrics"""
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def __init__(self):
+        self.spawn_counts_by_segment = {}  # segment_id -> total spawned vehicles
+        self.spawn_counts_by_edge = {}     # edge_idx -> total spawned vehicles
+    
+    def add_spawn(self, segment_id: int, edge_idx: int, count: int):
+        self.spawn_counts_by_segment[segment_id] = self.spawn_counts_by_segment.get(segment_id, 0) + count
+        self.spawn_counts_by_edge[edge_idx] = self.spawn_counts_by_edge.get(edge_idx, 0) + count
+    
+    def reset(self):
+        self.spawn_counts_by_segment.clear()
+        self.spawn_counts_by_edge.clear()
+
+
 def create_spawn_packets_function(departures: List[tuple], edge_id_map: Dict[str, int],
                                    edge_lengths: List[float], edge_speeds: List[float],
                                    edge_to_nodes: List[int] = None,
-                                   max_route_length: int = 256):
+                                   max_route_length: int = 256,
+                                   edge_first_segment: List[int] = None,
+                                   segments = None):
     """
     Create a host function that spawns packets according to departure schedule
     
     Args:
         departures: List of (time, origin_edge_id, route_list, count) tuples
         edge_id_map: Mapping from edge string IDs to integer indices
-        edge_lengths: List of edge lengths (indexed by edge_id)
-        edge_speeds: List of edge speeds (indexed by edge_id)
+        edge_lengths: List of edge lengths (indexed by edge_id) - used if no segments
+        edge_speeds: List of edge speeds (indexed by edge_id) - used if no segments
         edge_to_nodes: List of destination node indices (for rerouting)
+        edge_first_segment: List mapping edge_idx -> first segment index (for segment mode)
+        segments: List of SegmentData objects (for segment mode)
         
     Returns:
         Host function
@@ -320,11 +361,16 @@ def create_spawn_packets_function(departures: List[tuple], edge_id_map: Dict[str
     # Sort departures by time
     sorted_deps = sorted(departures, key=lambda x: x[0])
     
-    # Store edge data locally (not in CUDA env arrays - they cause JIT errors)
+    # Store data locally (not in CUDA env arrays)
     _edge_lengths = list(edge_lengths)
     _edge_speeds = list(edge_speeds)
     _edge_to_nodes = list(edge_to_nodes) if edge_to_nodes else []
-    _max_route = max_route_length  # Capture for closure
+    _max_route = max_route_length
+    
+    # Segment mode data
+    _use_segments = edge_first_segment is not None and segments is not None
+    _edge_first_segment = list(edge_first_segment) if edge_first_segment else []
+    _segments = list(segments) if segments else []
     
     class SpawnPacketsFunction(pyflamegpu.HostFunction):
         def __init__(self):
@@ -344,46 +390,107 @@ def create_spawn_packets_function(departures: List[tuple], edge_id_map: Dict[str
                 t, origin, route_list, count = sorted_deps[self.depart_index]
                 
                 # Convert route to edge indices
-                route_indices = [edge_id_map.get(e, -1) for e in route_list]
+                edge_route = [edge_id_map.get(e, -1) for e in route_list]
                 
-                # Pad route to max length (must match PacketConfig.max_route_length)
-                padded_route = (route_indices + [-1] * _max_route)[:_max_route]
-                
-                # Get edge properties from local Python data (not CUDA env)
-                origin_idx = route_indices[0] if route_indices else -1
-                if origin_idx < 0 or origin_idx >= len(_edge_lengths):
+                if _use_segments and edge_route:
+                    # SEGMENT MODE: Convert edge route to segment route
+                    # For each edge in route, add its first segment
+                    # The wait_for_entry will handle internal segment transitions
+                    segment_route = []
+                    for edge_idx in edge_route:
+                        if edge_idx >= 0 and edge_idx < len(_edge_first_segment):
+                            # Add first segment of this edge
+                            first_seg = _edge_first_segment[edge_idx]
+                            segment_route.append(first_seg)
+                    
+                    if not segment_route:
+                        self.depart_index += 1
+                        continue
+                    
+                    # Pad route to max length
+                    padded_route = (segment_route + [-1] * _max_route)[:_max_route]
+                    
+                    # Get first segment properties
+                    origin_segment = segment_route[0]
+                    seg = _segments[origin_segment]
+                    length = seg.length
+                    speed = seg.speed
+                    
+                    # Calculate next segment (either next in same edge, or first of next edge)
+                    next_segment = seg.next_segment
+                    if next_segment < 0 and len(segment_route) > 1:
+                        next_segment = segment_route[1]
+                    
+                    # Create packet agent
+                    packet = host_api.agent("Packet", "traveling").newAgent()
+                    packet.setVariableInt("size", count)
+                    packet.setVariableInt("curr_edge", seg.edge_idx)
+                    packet.setVariableInt("curr_segment", origin_segment)
+                    packet.setVariableInt("next_segment", next_segment)
+                    packet.setVariableArrayInt("route", padded_route)
+                    packet.setVariableInt("route_idx", 0)
+                    packet.setVariableInt("route_length", len(segment_route))
+                    packet.setVariableFloat("remaining_time", length / speed if speed > 0 else 1.0)
+                    packet.setVariableFloat("entry_time", current_time)
+                    packet.setVariableInt("destination", edge_route[-1] if edge_route else -1)
+                    packet.setVariableFloat("wait_time", 0.0)
+                    packet.setVariableInt("is_jammed", 0)
+                    
+                    # Node info for rerouting
+                    dest_idx = edge_route[-1] if edge_route else -1
+                    dest_node = _edge_to_nodes[dest_idx] if (dest_idx >= 0 and dest_idx < len(_edge_to_nodes)) else -1
+                    origin_edge = edge_route[0] if edge_route else -1
+                    curr_node = _edge_to_nodes[origin_edge] if (origin_edge >= 0 and origin_edge < len(_edge_to_nodes)) else -1
+                    packet.setVariableInt("curr_node", curr_node)
+                    packet.setVariableInt("dest_node", dest_node)
+                    
+                    # Track spawns per segment for interval_entered
+                    # (spawned vehicles bypass entry_request so we count them here)
+                    SpawnTracker.get_instance().add_spawn(origin_segment, seg.edge_idx, count)
+                    
+                    self.spawned_count += 1
                     self.depart_index += 1
-                    continue
-                
-                length = _edge_lengths[origin_idx]
-                speed = _edge_speeds[origin_idx]
-                
-                # Create packet agent using HostAgentAPI.newAgent()
-                packet = host_api.agent("Packet", "traveling").newAgent()
-                packet.setVariableInt("size", count)
-                packet.setVariableInt("curr_edge", origin_idx)
-                packet.setVariableInt("next_edge", route_indices[1] if len(route_indices) > 1 else -1)
-                packet.setVariableArrayInt("route", padded_route)
-                packet.setVariableInt("route_idx", 0)
-                packet.setVariableInt("route_length", len(route_indices))
-                packet.setVariableFloat("remaining_time", length / speed if speed > 0 else 1.0)
-                packet.setVariableFloat("entry_time", current_time)
-                packet.setVariableInt("destination", route_indices[-1] if route_indices else -1)
-                packet.setVariableFloat("wait_time", 0.0)
-                
-                # Set curr_node (end of start edge) and dest_node (end of destination edge) for rerouting
-                dest_idx = route_indices[-1] if route_indices else -1
-                dest_node = _edge_to_nodes[dest_idx] if (dest_idx >= 0 and dest_idx < len(_edge_to_nodes)) else -1
-                curr_node = _edge_to_nodes[origin_idx] if (origin_idx >= 0 and origin_idx < len(_edge_to_nodes)) else -1
-                packet.setVariableInt("curr_node", curr_node)
-                packet.setVariableInt("dest_node", dest_node)
-                
-                self.spawned_count += 1
-                self.depart_index += 1
-                
-                # Debug: print first few spawns
-                if self.spawned_count <= 5:
-                    print(f"  [Spawn] t={current_time:.1f}s packet #{self.spawned_count}: edge={origin_idx}, size={count}, route_len={len(route_indices)}")
+                    
+                    if self.spawned_count <= 5:
+                        print(f"  [Spawn] t={current_time:.1f}s packet #{self.spawned_count}: seg={origin_segment}, size={count}, route_len={len(segment_route)}")
+                    
+                else:
+                    # EDGE MODE (fallback): Use edge-based routing
+                    padded_route = (edge_route + [-1] * _max_route)[:_max_route]
+                    
+                    origin_idx = edge_route[0] if edge_route else -1
+                    if origin_idx < 0 or origin_idx >= len(_edge_lengths):
+                        self.depart_index += 1
+                        continue
+                    
+                    length = _edge_lengths[origin_idx]
+                    speed = _edge_speeds[origin_idx]
+                    
+                    packet = host_api.agent("Packet", "traveling").newAgent()
+                    packet.setVariableInt("size", count)
+                    packet.setVariableInt("curr_edge", origin_idx)
+                    packet.setVariableInt("curr_segment", origin_idx)  # In edge mode, segment=edge
+                    packet.setVariableInt("next_segment", edge_route[1] if len(edge_route) > 1 else -1)
+                    packet.setVariableArrayInt("route", padded_route)
+                    packet.setVariableInt("route_idx", 0)
+                    packet.setVariableInt("route_length", len(edge_route))
+                    packet.setVariableFloat("remaining_time", length / speed if speed > 0 else 1.0)
+                    packet.setVariableFloat("entry_time", current_time)
+                    packet.setVariableInt("destination", edge_route[-1] if edge_route else -1)
+                    packet.setVariableFloat("wait_time", 0.0)
+                    packet.setVariableInt("is_jammed", 0)
+                    
+                    dest_idx = edge_route[-1] if edge_route else -1
+                    dest_node = _edge_to_nodes[dest_idx] if (dest_idx >= 0 and dest_idx < len(_edge_to_nodes)) else -1
+                    curr_node = _edge_to_nodes[origin_idx] if (origin_idx >= 0 and origin_idx < len(_edge_to_nodes)) else -1
+                    packet.setVariableInt("curr_node", curr_node)
+                    packet.setVariableInt("dest_node", dest_node)
+                    
+                    self.spawned_count += 1
+                    self.depart_index += 1
+                    
+                    if self.spawned_count <= 5:
+                        print(f"  [Spawn] t={current_time:.1f}s packet #{self.spawned_count}: edge={origin_idx}, size={count}, route_len={len(edge_route)}")
     
     return SpawnPacketsFunction()
 
@@ -595,4 +702,84 @@ def create_rerouting_function(
                 print(f"  [Reroute] t={current_time:.1f}s: Rerouted {rerouted_this_step} packets (total: {self.reroute_count})")
     
     return ReroutingFunction()
+
+
+def create_weight_update_function(
+    num_edges: int,
+    edge_lengths: List[float],
+    adaptation_interval: float = 60.0,
+    adaptation_weight: float = 0.5,
+):
+    """
+    Create a host function that updates edge weights based on current congestion
+    
+    This collects travel times from EdgeQueue agents and maintains a moving average
+    for use in rerouting decisions.
+    
+    Args:
+        num_edges: Number of edges in the network
+        edge_lengths: Edge lengths for fallback calculation
+        adaptation_interval: How often to update weights [seconds]
+        adaptation_weight: Exponential smoothing weight (0=all new, 1=all old)
+        
+    Returns:
+        Host function and getter for current weights
+    """
+    if not FLAMEGPU_AVAILABLE:
+        return None, None
+    
+    class WeightUpdateFunction(pyflamegpu.HostFunction):
+        def __init__(self):
+            super().__init__()
+            self.last_update_time = 0.0
+            # Initialize with free-flow travel times
+            self.edge_travel_times = [0.0] * num_edges
+            self.initialized = False
+        
+        def run(self, host_api):
+            current_time = host_api.environment.getPropertyFloat("current_time")
+            
+            # Only update periodically
+            if current_time - self.last_update_time < adaptation_interval:
+                return
+            self.last_update_time = current_time
+            
+            # Collect travel times from EdgeQueue agents
+            edge_api = host_api.agent("EdgeQueue")
+            if edge_api.count() == 0:
+                return
+            
+            # Get edge population
+            edge_pop = edge_api.getPopulationData()
+            
+            for i in range(len(edge_pop)):
+                agent = edge_pop[i]
+                edge_id = agent.getVariableInt("edge_id")
+                if edge_id < 0 or edge_id >= num_edges:
+                    continue
+                
+                travel_time = agent.getVariableFloat("travel_time")
+                is_jammed = agent.getVariableInt("is_jammed")
+                
+                # Add penalty for jammed edges
+                if is_jammed:
+                    travel_time *= 1.5  # 50% penalty for jammed edges
+                
+                # Exponential moving average
+                if self.initialized:
+                    self.edge_travel_times[edge_id] = (
+                        adaptation_weight * self.edge_travel_times[edge_id] +
+                        (1 - adaptation_weight) * travel_time
+                    )
+                else:
+                    self.edge_travel_times[edge_id] = travel_time
+            
+            self.initialized = True
+        
+        def get_travel_times(self) -> List[float]:
+            """Get current edge travel times for routing"""
+            return self.edge_travel_times
+    
+    func = WeightUpdateFunction()
+    return func, lambda: func.get_travel_times()
 

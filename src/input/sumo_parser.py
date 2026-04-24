@@ -23,44 +23,129 @@ import re
 # Import core types
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from core.simulation import NetworkData, DemandData
+from core.simulation import NetworkData, DemandData, SegmentData
+
+
+def split_edge_into_segments(
+    edge_idx: int,
+    edge_id: str,
+    edge_length: float,
+    edge_speed: float,
+    edge_lanes: int,
+    edge_capacity: int,
+    edge_from_node: int,
+    edge_to_node: int,
+    edge_signal_id: int,
+    segment_length: float = 100.0,
+    jam_density: float = 0.15,
+    min_capacity: int = 5,
+) -> List[SegmentData]:
+    """
+    Split an edge into SUMO-style segments (~100m each).
+    
+    In SUMO meso, edges are divided into segments for finer-grained traffic flow.
+    Each segment acts as an independent queue with its own capacity and headway.
+    
+    Args:
+        edge_idx: Index of the parent edge
+        edge_id: ID of the parent edge
+        edge_length: Total edge length [m]
+        edge_speed: Speed limit [m/s]
+        edge_lanes: Number of lanes
+        edge_capacity: Total edge capacity
+        edge_from_node: Start node index
+        edge_to_node: End node index
+        edge_signal_id: Signal ID (-1 if none)
+        segment_length: Target segment length [m] (SUMO default: 98-100m)
+        jam_density: Jam density for capacity calculation [veh/m/lane]
+        min_capacity: Minimum capacity per segment
+        
+    Returns:
+        List of SegmentData objects
+    """
+    # Calculate number of segments (SUMO formula)
+    num_segments = max(1, round(edge_length / segment_length))
+    actual_segment_length = edge_length / num_segments
+    
+    segments = []
+    for seg_idx in range(num_segments):
+        # Segment ID format matches SUMO: "edge_id:segment_idx"
+        seg_id = f"{edge_id}:{seg_idx}"
+        
+        # Calculate segment capacity
+        seg_capacity = max(min_capacity, int(actual_segment_length * edge_lanes * jam_density))
+        
+        # Next segment is seg_idx + 1, or -1 if this is the last segment
+        next_seg = -1  # Will be set after all segments created
+        
+        # From/to nodes: only meaningful for first/last segments
+        from_node = edge_from_node if seg_idx == 0 else -1
+        to_node = edge_to_node if seg_idx == num_segments - 1 else -1
+        
+        # Signal only on last segment (junction)
+        signal_id = edge_signal_id if seg_idx == num_segments - 1 else -1
+        
+        segments.append(SegmentData(
+            segment_id=seg_id,
+            edge_id=edge_id,
+            edge_idx=edge_idx,
+            segment_idx=seg_idx,
+            length=actual_segment_length,
+            speed=edge_speed,
+            capacity=seg_capacity,
+            lanes=edge_lanes,
+            next_segment=-1,  # Will be set later
+            from_node=from_node,
+            to_node=to_node,
+            signal_id=signal_id,
+        ))
+    
+    return segments
 
 
 @dataclass
 class SUMOMesoConfig:
-    """SUMO Mesoscopic simulation parameters from .sumocfg"""
-    # Mesoscopic TAU factors (travel time adjustment)
-    tau_ff: float = 1.4      # Free-flow to free-flow
-    tau_fj: float = 1.4      # Free-flow to jam
-    tau_jf: float = 2.0      # Jam to free-flow  
-    tau_jj: float = 1.4      # Jam to jam
+    """SUMO Mesoscopic simulation parameters from .sumocfg
+    
+    Reference: https://sumo.dlr.de/docs/Simulation/Meso.html
+    """
+    # Mesoscopic TAU factors (headway times in seconds)
+    # These control the minimum time between vehicles leaving a segment
+    tau_ff: float = 1.4      # Free-flow to free-flow headway
+    tau_fj: float = 1.4      # Free-flow to jam headway
+    tau_jf: float = 2.0      # Jam to free-flow headway  
+    tau_jj: float = 2.0      # Jam to jam headway (SUMO default is 2.0)
     
     # Queue/segment parameters
     meso_edgelength: float = 98.0    # Segment length for queues [m]
-    jam_threshold: float = -1.0       # Jam threshold (negative = auto)
-    multi_queue: bool = True          # Use multi-queue model
-    junction_control: bool = True     # Junction-based control
-    lane_queue: bool = False          # Per-lane queuing
-    overtaking: bool = False          # Allow overtaking
+    jam_threshold: float = -1.0       # Jam threshold (negative = auto-calculate)
+    multi_queue: bool = True          # Use multi-queue model per segment
+    junction_control: bool = True     # Junction-based flow control
+    lane_queue: bool = False          # Per-lane queuing (vs per-edge)
+    overtaking: bool = False          # Allow faster vehicles to overtake
     
-    # Penalties
+    # Penalties (added to travel time)
     tls_penalty: float = 0.0          # Traffic light penalty [s]
-    tls_flow_penalty: float = 0.0     # TLS flow-based penalty
-    minor_penalty: float = 0.0        # Minor road penalty [s]
+    tls_flow_penalty: float = 0.0     # TLS flow-based penalty factor
+    minor_penalty: float = 0.0        # Minor road priority penalty [s]
     
     # Rerouting parameters  
-    rerouting_probability: float = 0.0   # Fraction of vehicles that reroute
+    rerouting_probability: float = 0.0   # Fraction of vehicles that can reroute
     rerouting_period: float = 60.0       # Rerouting check interval [s]
-    rerouting_adaptation_interval: float = 60.0  # Travel time adaptation interval
-    rerouting_adaptation_steps: int = 1  # Number of adaptation steps
-    rerouting_threshold_factor: float = 1.0  # Threshold to trigger reroute
-    rerouting_threshold_constant: float = 0.0  # Constant threshold
-    routing_algorithm: str = "dijkstra"  # Routing algorithm
+    rerouting_adaptation_interval: float = 1.0  # Edge weight adaptation interval [s]
+    rerouting_adaptation_steps: int = 180  # Number of steps for moving average
+    rerouting_adaptation_weight: float = 0.5  # Exponential smoothing weight
+    rerouting_threshold_factor: float = 1.0  # Threshold factor to trigger reroute
+    rerouting_threshold_constant: float = 0.0  # Constant threshold to trigger reroute
+    routing_algorithm: str = "astar"  # Routing algorithm (dijkstra, astar, CH)
+    weights_random_factor: float = 1.0  # Random factor for edge weights
+    weights_priority_factor: float = 0.0  # Priority-based weight factor
     
     # Processing parameters
-    time_to_teleport: float = -1.0    # Teleport stuck vehicles (-1 = disabled)
-    time_to_impatience: float = 1e12  # Time until impatience kicks in
-    teleport_disconnected: float = -1.0  # Teleport on disconnected
+    time_to_teleport: float = 180.0   # Teleport stuck vehicles after N seconds
+    time_to_impatience: float = 7.0   # Time until impatience kicks in [s]
+    teleport_disconnected: float = 1.0  # Teleport on disconnected edges [s]
+    ignore_junction_blocker: float = 1.0  # Ignore blocking at junctions
     
     # Time parameters
     step_length: float = 1.0          # Simulation step length [s]
@@ -69,6 +154,9 @@ class SUMOMesoConfig:
     
     # Random seed
     seed: int = 42
+    
+    # Scale factor for demand
+    scale: float = 1.0
 
 
 class SUMOConfigParser:
@@ -108,23 +196,28 @@ class SUMOConfigParser:
             config.tls_flow_penalty = self._get_value(meso, "meso-tls-flow-penalty", config.tls_flow_penalty)
             config.minor_penalty = self._get_value(meso, "meso-minor-penalty", config.minor_penalty)
         
-        # Parse routing section
-        routing = root.find("routing")
-        if routing is not None:
-            config.rerouting_probability = self._get_value(routing, "device.rerouting.probability", config.rerouting_probability)
-            config.rerouting_period = self._get_value(routing, "device.rerouting.period", config.rerouting_period)
-            config.rerouting_adaptation_interval = self._get_value(routing, "device.rerouting.adaptation-interval", config.rerouting_adaptation_interval)
-            config.rerouting_adaptation_steps = int(self._get_value(routing, "device.rerouting.adaptation-steps", config.rerouting_adaptation_steps))
-            config.rerouting_threshold_factor = self._get_value(routing, "device.rerouting.threshold.factor", config.rerouting_threshold_factor)
-            config.rerouting_threshold_constant = self._get_value(routing, "device.rerouting.threshold.constant", config.rerouting_threshold_constant)
-            config.routing_algorithm = self._get_str(routing, "routing-algorithm", config.routing_algorithm)
-        
         # Parse processing section
         processing = root.find("processing")
         if processing is not None:
             config.time_to_teleport = self._get_value(processing, "time-to-teleport", config.time_to_teleport)
             config.time_to_impatience = self._get_value(processing, "time-to-impatience", config.time_to_impatience)
             config.teleport_disconnected = self._get_value(processing, "time-to-teleport.disconnected", config.teleport_disconnected)
+            config.ignore_junction_blocker = self._get_value(processing, "ignore-junction-blocker", config.ignore_junction_blocker)
+            config.scale = self._get_value(processing, "scale", config.scale)
+        
+        # Parse routing section (some params may be in routing subsection)
+        routing = root.find("routing")
+        if routing is not None:
+            config.rerouting_probability = self._get_value(routing, "device.rerouting.probability", config.rerouting_probability)
+            config.rerouting_period = self._get_value(routing, "device.rerouting.period", config.rerouting_period)
+            config.rerouting_adaptation_interval = self._get_value(routing, "device.rerouting.adaptation-interval", config.rerouting_adaptation_interval)
+            config.rerouting_adaptation_steps = int(self._get_value(routing, "device.rerouting.adaptation-steps", config.rerouting_adaptation_steps))
+            config.rerouting_adaptation_weight = self._get_value(routing, "device.rerouting.adaptation-weight", config.rerouting_adaptation_weight)
+            config.rerouting_threshold_factor = self._get_value(routing, "device.rerouting.threshold.factor", config.rerouting_threshold_factor)
+            config.rerouting_threshold_constant = self._get_value(routing, "device.rerouting.threshold.constant", config.rerouting_threshold_constant)
+            config.routing_algorithm = self._get_str(routing, "routing-algorithm", config.routing_algorithm)
+            config.weights_random_factor = self._get_value(routing, "weights.random-factor", config.weights_random_factor)
+            config.weights_priority_factor = self._get_value(routing, "weights.priority-factor", config.weights_priority_factor)
         
         # Parse time section
         time_section = root.find("time")
@@ -232,6 +325,7 @@ class SUMONetworkParser:
     - Nodes (junctions)
     - Traffic lights (signal controllers)
     - Connection topology
+    - Segments (SUMO meso-style ~100m chunks)
     
     Usage:
         parser = SUMONetworkParser()
@@ -242,18 +336,24 @@ class SUMONetworkParser:
                  jam_density: float = 0.15,  # Realistic jam density
                  min_capacity: int = 20,     # Minimum capacity per edge to prevent bottlenecks
                  default_speed: float = 13.89,
-                 skip_internal: bool = True):
+                 skip_internal: bool = True,
+                 segment_length: float = 100.0,  # SUMO meso default ~98-100m
+                 use_segments: bool = True):  # Enable segment-based simulation
         """
         Args:
             jam_density: Jam density for capacity calculation [veh/m/lane]
             min_capacity: Minimum capacity per edge (prevents tiny edges from blocking)
             default_speed: Default speed if not specified [m/s]
             skip_internal: Skip internal/connector edges
+            segment_length: Target segment length for SUMO meso compatibility [m]
+            use_segments: Whether to split edges into segments
         """
         self.jam_density = jam_density
         self.min_capacity = min_capacity
         self.default_speed = default_speed
         self.skip_internal = skip_internal
+        self.segment_length = segment_length
+        self.use_segments = use_segments
         
         self.edges: Dict[str, SUMOEdge] = {}
         self.nodes: Dict[str, SUMONode] = {}
@@ -461,6 +561,62 @@ class SUMONetworkParser:
                     node_adjacency[from_node_idx] = []
                 node_adjacency[from_node_idx].append(edge_idx)
         
+        # Generate segments if enabled
+        segments: List[SegmentData] = []
+        segment_id_map: Dict[str, int] = {}
+        edge_to_segments: Dict[int, List[int]] = {}
+        edge_first_segment: List[int] = []
+        edge_last_segment: List[int] = []
+        
+        if self.use_segments:
+            segment_idx = 0
+            for edge_idx, edge in enumerate(edge_list):
+                # Get edge properties
+                edge_cap = edge_capacities[edge_idx]
+                from_node = edge_from_nodes[edge_idx]
+                to_node = edge_to_nodes_list[edge_idx]
+                signal_id = edge_signal_ids[edge_idx]
+                
+                # Split this edge into segments
+                edge_segments = split_edge_into_segments(
+                    edge_idx=edge_idx,
+                    edge_id=edge.id,
+                    edge_length=edge.length,
+                    edge_speed=edge.speed,
+                    edge_lanes=edge.lanes,
+                    edge_capacity=edge_cap,
+                    edge_from_node=from_node,
+                    edge_to_node=to_node,
+                    edge_signal_id=signal_id,
+                    segment_length=self.segment_length,
+                    jam_density=self.jam_density,
+                    min_capacity=max(3, self.min_capacity // 4),  # Smaller min for segments
+                )
+                
+                # Record first and last segment indices for this edge
+                first_seg_idx = segment_idx
+                edge_first_segment.append(first_seg_idx)
+                
+                seg_indices_for_edge = []
+                for seg in edge_segments:
+                    segments.append(seg)
+                    segment_id_map[seg.segment_id] = segment_idx
+                    seg_indices_for_edge.append(segment_idx)
+                    segment_idx += 1
+                
+                edge_last_segment.append(segment_idx - 1)
+                edge_to_segments[edge_idx] = seg_indices_for_edge
+                
+                # Now set next_segment pointers within the edge
+                for i, seg_global_idx in enumerate(seg_indices_for_edge):
+                    if i < len(seg_indices_for_edge) - 1:
+                        # Point to next segment in same edge
+                        segments[seg_global_idx].next_segment = seg_indices_for_edge[i + 1]
+                    else:
+                        # Last segment in edge - next_segment stays -1
+                        # Will need to look up next edge's first segment at runtime
+                        segments[seg_global_idx].next_segment = -1
+        
         return NetworkData(
             edge_ids=edge_ids,
             edge_id_map=edge_id_map,
@@ -476,6 +632,12 @@ class SUMONetworkParser:
             edge_signal_ids=edge_signal_ids,
             node_adjacency=node_adjacency,
             signals=signals_list,
+            # Segment fields
+            segments=segments,
+            segment_id_map=segment_id_map,
+            edge_to_segments=edge_to_segments,
+            edge_first_segment=edge_first_segment,
+            edge_last_segment=edge_last_segment,
         )
 
 

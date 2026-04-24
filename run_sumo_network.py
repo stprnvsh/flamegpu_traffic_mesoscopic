@@ -119,6 +119,10 @@ def main():
     print(f"  Total vehicles: {demand.total_vehicles}")
     print(f"  Packet departures: {demand.num_departures}")
     
+    # Determine output file name based on network
+    net_name = Path(net_file).stem.replace('.net', '')
+    metrics_file = f"{net_name}_metrics.parquet"
+    
     # Configure simulation with meso parameters if available
     if meso_config:
         # Enable rerouting if probability > 0 in config
@@ -138,6 +142,9 @@ def main():
             rerouting_enabled=rerouting_enabled,
             rerouting_period=meso_config.rerouting_period,
             rerouting_probability=meso_config.rerouting_probability,
+            # Metrics output
+            metrics_interval=900.0,  # Aggregate every 15 minutes
+            metrics_file=metrics_file,
         )
         
         if rerouting_enabled:
@@ -147,6 +154,9 @@ def main():
             duration=duration,
             time_step=1.0,
             verbose=True,
+            # Metrics output
+            metrics_interval=900.0,  # Aggregate every 15 minutes
+            metrics_file=metrics_file,
         )
     
     # Create and run simulation
@@ -176,10 +186,43 @@ def main():
         print(f"  Edges with vehicles: {occupied}/{network.num_edges}")
         print(f"  Total vehicles on network: {total_vehicles}")
     
-    # Export results
-    output_file = "simulation_results.json"
+    # Get edge data summary (SUMO edgeData style)
+    edge_df = sim.get_edge_data()
+    if edge_df is not None and len(edge_df) > 0:
+        active_edges = len(edge_df[edge_df['entered'] > 0])
+        edges_with_traffic = edge_df[edge_df['entered'] > 0]
+        
+        print(f"\n  Edge Data (SUMO format): {len(edge_df)} edges")
+        print(f"  Edges with traffic: {active_edges}/{network.num_edges}")
+        print(f"  Total entered: {edge_df['entered'].sum()}")
+        print(f"  Total left: {edge_df['left'].sum()}")
+        if len(edges_with_traffic) > 0:
+            print(f"  Total sampledSeconds: {edge_df['sampledSeconds'].sum():.0f}")
+            print(f"  Avg density: {edges_with_traffic['density'].mean():.4f} veh/km")
+            print(f"  Max density: {edge_df['density'].max():.4f} veh/km")
+            print(f"  Avg flow: {edges_with_traffic['flow'].mean():.0f} veh/h")
+            print(f"  Avg speed: {edges_with_traffic['speed'].mean():.1f} m/s")
+    
+    # Get network metrics summary  
+    network_df = sim.get_metrics_dataframe()
+    if network_df is not None and len(network_df) > 0:
+        print(f"\n  Network summary: {len(network_df)} intervals")
+        print(f"  Total entered: {network_df['entered'].sum()}")
+        print(f"  Total left: {network_df['left'].sum()}")
+        print(f"  Avg density: {network_df['density'].mean():.4f} veh/km")
+        print(f"  Avg flow: {network_df['flow'].mean():.0f} veh/h")
+    
+    # Export results (JSON summary)
+    output_file = f"{net_name}_results.json"
     sim.export_results(output_file)
     print(f"\nResults exported to {output_file}")
+    
+    # Show output files
+    network_file = metrics_file.replace('.parquet', '_network.parquet')
+    edge_file = metrics_file.replace('.parquet', '_edges.parquet')
+    print(f"\nOutput files:")
+    print(f"  Edges:   {edge_file} (per-edge per-interval data, SUMO edgeData style)")
+    print(f"  Network: {network_file} (network-level interval summaries)")
     
     return results
 

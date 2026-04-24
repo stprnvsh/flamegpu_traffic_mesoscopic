@@ -34,6 +34,11 @@ from .simulation import (
     SimulationConfig,
 )
 
+from .metrics import (
+    MetricsConfig,
+    create_edge_data_function,
+)
+
 __all__ = [
     'MesoscopicTrafficModel',
     'create_model',
@@ -43,4 +48,6 @@ __all__ = [
     'define_messages',
     'MesoscopicSimulation',
     'SimulationConfig',
+    'MetricsConfig',
+    'create_edge_data_function',
 ]

@@ -11,8 +11,24 @@ A GPU-accelerated mesoscopic traffic simulation using FLAMEGPU2, comparable to S
 - **Traffic Signals**: Full signal phase support
 - **Teleporting**: SUMO-compatible stuck vehicle handling
 - **Agent Compaction**: Efficient memory management for high-throughput simulations
+- **Parquet Output**: Time-series metrics export for analysis
 
 ## Installation
+
+### Using pip (recommended)
+
+```bash
+# Install from source
+pip install -e .
+
+# Or with development dependencies
+pip install -e ".[dev]"
+
+# Or with all extras (viz, docs, dev)
+pip install -e ".[all]"
+```
+
+### Manual Installation
 
 ```bash
 # Install dependencies
@@ -25,7 +41,7 @@ pip install --extra-index-url https://whl.flamegpu.com/whl/cuda120/ pyflamegpu
 ```
 
 **Requirements:**
-- Python 3.10+
+- Python 3.8+
 - NVIDIA GPU (Compute Capability 6.0+)
 - CUDA Toolkit 11.0+ (matching pyflamegpu version)
 
@@ -69,9 +85,11 @@ demand = parse_sumo_routes("routes.rou.xml", edge_id_map=network.edge_id_map)
 
 # Configure simulation
 config = SimulationConfig(
-    duration=86400.0,      # 24 hours
-    time_step=1.0,         # 1 second steps
+    duration=86400.0,        # 24 hours
+    time_step=1.0,           # 1 second steps
     verbose=True,
+    metrics_interval=900.0,  # Collect metrics every 15 min
+    metrics_file="output.parquet",
 )
 
 # Run simulation
@@ -82,8 +100,55 @@ sim.load_demand(demand)
 sim.initialize()
 results = sim.run()
 
-# Export results
-sim.export_results("results.json")
+# Get metrics as DataFrame
+df = sim.get_metrics_dataframe()
+print(df)
+
+# Save metrics manually (also done automatically)
+sim.save_metrics("custom_output.parquet")
+```
+
+## Output
+
+### Parquet Metrics (Time-Series)
+
+The simulation automatically exports time-series metrics to Parquet format:
+
+```python
+import pandas as pd
+
+# Read collected metrics
+df = pd.read_parquet("arbon_metrics.parquet")
+print(df.columns)
+```
+
+| Column | Description |
+|--------|-------------|
+| `timestamp_s` | Simulation time in seconds |
+| `timestamp_h` | Simulation time in hours |
+| `packets_total` | Total vehicles in simulation |
+| `packets_traveling` | Vehicles currently moving |
+| `packets_waiting` | Vehicles waiting at junctions |
+| `vehicles_on_edges` | Vehicles on edge queues |
+| `edge_capacity_total` | Total network capacity |
+| `utilization` | Network utilization (0-1) |
+| `density_veh_per_km` | Average density (vehicles/km) |
+| `avg_remaining_time_s` | Average remaining travel time |
+
+### JSON Results (Summary)
+
+Final simulation state is exported as JSON:
+
+```json
+{
+  "steps": 86400,
+  "final_packet_count": 370,
+  "packets_traveling": 370,
+  "packets_waiting": 0,
+  "edge_stats": [
+    {"edge_id": 0, "curr_count": 5, "travel_time": 12.5}
+  ]
+}
 ```
 
 ## Architecture
@@ -130,7 +195,8 @@ for (const auto& msg : FLAMEGPU->message_in(curr_node)) {
 │   │   ├── agents.py       # Agent definitions (RTC CUDA code)
 │   │   ├── messages.py     # Message type definitions
 │   │   ├── model.py        # FLAMEGPU2 model builder
-│   │   └── simulation.py   # Simulation runner
+│   │   ├── simulation.py   # Simulation runner
+│   │   └── metrics.py      # Metrics collection & Parquet export
 │   ├── input/
 │   │   └── sumo_parser.py  # SUMO file parsers
 │   └── traffic_models/
@@ -141,6 +207,7 @@ for (const auto& msg : FLAMEGPU->message_in(curr_node)) {
 │   └── toy_simulation.py   # Simple example
 ├── tests/                  # Unit tests
 ├── docs/                   # Documentation
+├── pyproject.toml          # Package configuration
 └── run_sumo_network.py     # Main entry point
 ```
 
@@ -150,9 +217,16 @@ for (const auto& msg : FLAMEGPU->message_in(curr_node)) {
 
 ```python
 SimulationConfig(
+    # Time settings
     duration=3600.0,           # Simulation duration [s]
     time_step=1.0,             # Time step [s] (use 5.0 for faster runs)
-    output_interval=60.0,      # Logging interval [s]
+    
+    # Output settings
+    output_interval=60.0,      # Console logging interval [s]
+    metrics_interval=900.0,    # Parquet metrics interval [s] (default: 15 min)
+    metrics_file="metrics.parquet",  # Output file for time-series
+    collect_edge_metrics=True, # Include per-edge aggregates
+    
     verbose=True,              # Print progress
     random_seed=42,            # For reproducibility
     
@@ -193,8 +267,12 @@ The simulation reads mesoscopic parameters from `.sumocfg` files:
 # 1. Increase time step (5x speedup)
 config = SimulationConfig(time_step=5.0)
 
-# 2. Reduce logging (10-20% speedup)
-config = SimulationConfig(output_interval=600.0, verbose=False)
+# 2. Reduce logging frequency
+config = SimulationConfig(
+    output_interval=600.0,   # Console: every 10 min
+    metrics_interval=1800.0, # Parquet: every 30 min
+    verbose=False,
+)
 
 # 3. Agent compaction is enabled by default for large simulations
 ```
@@ -207,20 +285,48 @@ SUMO files with non-UTF-8 characters (German umlauts) need conversion:
 iconv -f LATIN1 -t UTF-8 network.net.xml > network_utf8.net.xml
 ```
 
-## Output
+## Analysis Example
 
-Results are exported as JSON:
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
 
-```json
-{
-  "steps": 86400,
-  "final_packet_count": 370,
-  "packets_traveling": 370,
-  "packets_waiting": 0,
-  "edge_stats": [
-    {"edge_id": 0, "curr_count": 5, "capacity": 50, "travel_time": 12.5}
-  ]
-}
+# Load metrics
+df = pd.read_parquet("arbon_metrics.parquet")
+
+# Plot vehicle counts over time
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+# Total vehicles
+axes[0, 0].plot(df['timestamp_h'], df['packets_total'])
+axes[0, 0].set_xlabel('Time (hours)')
+axes[0, 0].set_ylabel('Total Vehicles')
+axes[0, 0].set_title('Vehicle Count Over Time')
+
+# Utilization
+axes[0, 1].plot(df['timestamp_h'], df['utilization'] * 100)
+axes[0, 1].set_xlabel('Time (hours)')
+axes[0, 1].set_ylabel('Utilization (%)')
+axes[0, 1].set_title('Network Utilization')
+
+# Density
+axes[1, 0].plot(df['timestamp_h'], df['density_veh_per_km'])
+axes[1, 0].set_xlabel('Time (hours)')
+axes[1, 0].set_ylabel('Density (veh/km)')
+axes[1, 0].set_title('Average Density')
+
+# Traveling vs Waiting
+axes[1, 1].stackplot(df['timestamp_h'], 
+                      df['packets_traveling'], 
+                      df['packets_waiting'],
+                      labels=['Traveling', 'Waiting'])
+axes[1, 1].legend()
+axes[1, 1].set_xlabel('Time (hours)')
+axes[1, 1].set_ylabel('Vehicles')
+axes[1, 1].set_title('Vehicle State Distribution')
+
+plt.tight_layout()
+plt.savefig('simulation_analysis.png')
 ```
 
 ## Documentation
@@ -238,7 +344,11 @@ Detailed documentation in `docs/`:
 ## Testing
 
 ```bash
+# Run all tests
 pytest tests/ -v
+
+# Run with coverage
+pytest tests/ --cov=src --cov-report=html
 ```
 
 ## License
